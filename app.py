@@ -1,4 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+
+import asyncio
+import sys
+
+if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+    # Windows selector loop avoids the noisy proactor connection-reset logs here.
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from nicegui import ui
 

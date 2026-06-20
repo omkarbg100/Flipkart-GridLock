@@ -23,6 +23,7 @@ class DashboardJob:
     id: str
     kind: str
     source_label: str
+    options: AnalysisOptions | None = None
     status: str = "queued"
     message: str = "Queued"
     progress: float = 0.0
@@ -36,6 +37,7 @@ class DashboardJob:
     recent_violations: list = field(default_factory=list)
     preview_b64: str = ""
     preview_caption: str = ""
+    preview_seq: int = 0
     error: str = ""
     result: dict = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -54,14 +56,27 @@ class DashboardJob:
         if cv2 is None or frame is None:
             return
 
-        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if not ok:
             return
 
         with self.lock:
             self.preview_b64 = base64.b64encode(encoded.tobytes()).decode("utf-8")
             self.preview_caption = caption
+            self.preview_seq += 1
             self.updated_at = time.time()
+
+    def apply_options(self, updates: AnalysisOptions) -> bool:
+        if self.options is None:
+            return False
+
+        with self.lock:
+            for key, value in vars(updates).items():
+                if key == "source_label":
+                    continue
+                setattr(self.options, key, value)
+            self.updated_at = time.time()
+        return True
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -82,6 +97,7 @@ class DashboardJob:
                 "error": self.error,
                 "preview_b64": self.preview_b64,
                 "preview_caption": self.preview_caption,
+                "preview_seq": self.preview_seq,
             }
 
 
@@ -103,6 +119,10 @@ class JobManager:
             source_label=source_label,
         )
         return self._register(job)
+
+    @staticmethod
+    def _attach_options(job: DashboardJob, options: AnalysisOptions) -> None:
+        job.options = options
 
     def list_jobs(self) -> list[dict]:
         with self._lock:
@@ -144,6 +164,7 @@ class JobManager:
         self.processor.ensure_ready()
         source_label = options.source_label or Path(video_path).name
         job = self._new_job("upload", source_label)
+        self._attach_options(job, options)
         threading.Thread(target=self._run_job, args=(job, video_path, options, False), daemon=True).start()
         return job
 
@@ -151,6 +172,7 @@ class JobManager:
         self.processor.ensure_ready()
         source_label = options.source_label or Path(image_path).name
         job = self._new_job("image", source_label)
+        self._attach_options(job, options)
         threading.Thread(target=self._run_image_job, args=(job, image_path, options), daemon=True).start()
         return job
 
@@ -158,8 +180,15 @@ class JobManager:
         self.processor.ensure_ready()
         source_label = options.source_label or f"Camera {camera_index}"
         job = self._new_job("live", source_label)
+        self._attach_options(job, options)
         threading.Thread(target=self._run_job, args=(job, camera_index, options, True), daemon=True).start()
         return job
+
+    def apply_live_options(self, job_id: str, updates: AnalysisOptions) -> bool:
+        job = self.get_job(job_id)
+        if not job:
+            return False
+        return job.apply_options(updates)
 
     def _run_job(self, job: DashboardJob, source, options: AnalysisOptions, live: bool) -> None:
         try:

@@ -84,6 +84,7 @@ def dashboard() -> None:
         "error": "",
         "name": "",
     }
+    live_preview_state: dict[str, Any] = {"job_id": "", "seq": -1, "updated_at": 0.0}
 
     def refresh_live_sections(include_evidence: bool = False) -> None:
         summary_strip.refresh()
@@ -91,9 +92,36 @@ def dashboard() -> None:
         hotspots_panel.refresh()
         alerts_panel.refresh()
         jobs_panel.refresh()
-        live_processing_panel.refresh()
+        refresh_live_preview(force=True)
         if include_evidence:
             evidence_panel.refresh()
+
+    def refresh_live_preview(*, force: bool = False) -> None:
+        active_job = job_manager.get_active_job()
+        if not active_job:
+            if force or live_preview_state["job_id"]:
+                live_preview_state.update({"job_id": "", "seq": -1, "updated_at": 0.0})
+                live_meta_strip.refresh()
+                live_preview_content.refresh()
+            return
+
+        snapshot = active_job.snapshot()
+        job_id = str(snapshot.get("id", ""))
+        preview_seq = int(snapshot.get("preview_seq", 0))
+        updated_at = float(snapshot.get("updated_at", 0.0) or 0.0)
+        if (
+            not force
+            and job_id == live_preview_state["job_id"]
+            and preview_seq == live_preview_state["seq"]
+            and updated_at == live_preview_state["updated_at"]
+        ):
+            return
+        live_preview_state.update({"job_id": job_id, "seq": preview_seq, "updated_at": updated_at})
+        live_meta_strip.refresh()
+        live_preview_content.refresh()
+
+    def tick_live_preview() -> None:
+        refresh_live_preview()
 
     async def handle_upload(event) -> None:
         try:
@@ -161,10 +189,31 @@ def dashboard() -> None:
             storage["selected_job_id"] = job.id
             ui.notify(f"Started analysis job {job.id}", type="positive")
             jobs_panel.refresh()
-            live_processing_panel.refresh()
+            refresh_live_preview(force=True)
             summary_strip.refresh()
         except Exception as exc:
             ui.notify(f"Could not start upload analysis: {exc}", type="negative")
+
+    def apply_live_settings_to_active_job() -> None:
+        active_job = job_manager.get_active_job()
+        if not active_job or active_job.options is None:
+            ui.notify("No running analysis to update", type="warning")
+            return
+        try:
+            live_options = build_options_from_controls(
+                controls,
+                settings,
+                source_label=active_job.source_label,
+            )
+            if not job_manager.apply_live_options(active_job.id, live_options):
+                ui.notify("Could not update the running analysis", type="negative")
+                return
+            active_job.update_status(message="Live settings updated")
+            ui.notify("Applied the new settings to the running job", type="positive")
+            refresh_live_preview(force=True)
+            jobs_panel.refresh()
+        except Exception as exc:
+            ui.notify(f"Could not apply live settings: {exc}", type="negative")
 
     def start_webcam_analysis() -> None:
         if not analysis_ready:
@@ -176,7 +225,7 @@ def dashboard() -> None:
             storage["selected_job_id"] = job.id
             ui.notify(f"Started webcam job {job.id}", type="positive")
             jobs_panel.refresh()
-            live_processing_panel.refresh()
+            refresh_live_preview(force=True)
             summary_strip.refresh()
         except Exception as exc:
             ui.notify(f"Could not start webcam analysis: {exc}", type="negative")
@@ -197,7 +246,7 @@ def dashboard() -> None:
             return
         storage["selected_job_id"] = latest["id"]
         jobs_panel.refresh()
-        live_processing_panel.refresh()
+        refresh_live_preview(force=True)
         ui.notify(f"Focused job {latest['id']}", type="info")
 
     def save_defaults_from_controls() -> None:
@@ -354,12 +403,9 @@ def dashboard() -> None:
                     ui.label("JPG, PNG, MP4, AVI, MOV, and MKV are supported for upload.").classes("field-hint")
 
     @ui.refreshable
-    def live_processing_panel() -> None:
+    def live_meta_strip() -> None:
         active_job = job_manager.get_active_job()
-        with ui.card().classes("glass-card flex-1 min-w-0 preview-stage"):
-            ui.label("Live annotated scan").classes("section-title")
-            ui.label("Exact processed frames with overlays, status, and progress from the current job.").classes("section-copy")
-
+        with ui.column().classes("w-full gap-2"):
             if active_job:
                 latest_snapshot = active_job.snapshot()
                 status_label = f"{latest_snapshot['kind'].title()} | {latest_snapshot['status'].title()}"
@@ -377,24 +423,59 @@ def dashboard() -> None:
                     ui.label(f"Violations: {latest_snapshot.get('violations_logged', 0)}").classes("status-chip")
                     ui.label(f"Total: {latest_snapshot.get('total_frames', 0)}").classes("status-chip")
                     ui.label(f"Updated: {human_time(latest_snapshot.get('updated_at'))}").classes("status-chip")
-
-                preview_b64 = latest_snapshot.get("preview_b64", "")
-                if preview_b64:
-                    ui.label("Annotated frame").classes("field-label")
-                    ui.image(f"data:image/jpeg;base64,{preview_b64}").classes("w-full live-frame")
-                    ui.label(
-                        latest_snapshot.get("preview_caption") or "Annotated frame with stop line, zones, and OCR overlays."
-                    ).classes("field-hint")
-                else:
-                    with ui.column().classes("stage-placeholder items-center justify-center w-full gap-3"):
-                        ui.spinner(size="lg")
-                        ui.label("Processing started").classes("section-title")
-                        ui.label("The annotated frame will appear here as soon as the first scanned frame is ready.").classes("field-hint")
             else:
-                with ui.column().classes("stage-placeholder items-center justify-center w-full gap-3"):
-                    ui.icon("motion_photos_auto", size="4rem").classes("text-slate-400")
-                    ui.label("Start analysis to see the live annotated frame here").classes("section-title")
-                    ui.label("This pane shows detected vehicles, red-line markers, parking boxes, wrong-side lanes, and OCR results.").classes("field-hint")
+                ui.label("No active job yet").classes("status-chip")
+                ui.label("Start analysis to stream the processed frame here.").classes("field-hint")
+
+    @ui.refreshable
+    def live_preview_content() -> None:
+        active_job = job_manager.get_active_job()
+        snapshot = active_job.snapshot() if active_job else None
+        preview_b64 = str(snapshot.get("preview_b64", "") or "") if snapshot else ""
+        preview_caption = (
+            str(
+                snapshot.get("preview_caption")
+                or (
+                    snapshot.get("message")
+                    if snapshot and not preview_b64
+                    else "Annotated frame with stop line, zones, and OCR overlays."
+                )
+                or "Annotated frame with stop line, zones, and OCR overlays."
+            )
+            if snapshot
+            else ""
+        )
+
+        if preview_b64:
+            with ui.column().classes("w-full gap-2"):
+                ui.image(f"data:image/jpeg;base64,{preview_b64}").classes("w-full live-frame")
+                if preview_caption:
+                    ui.label(preview_caption).classes("field-hint")
+            return
+
+        if snapshot:
+            with ui.column().classes("stage-placeholder items-center justify-center w-full gap-3"):
+                ui.spinner(size="lg")
+                ui.label("Processing started").classes("section-title")
+                ui.label(
+                    snapshot.get("message") or "The first annotated frame will appear here as soon as it is ready."
+                ).classes("field-hint")
+            return
+
+        with ui.column().classes("stage-placeholder items-center justify-center w-full gap-3"):
+            ui.icon("motion_photos_auto", size="4rem").classes("text-slate-400")
+            ui.label("Start analysis to see the live annotated frame here").classes("section-title")
+            ui.label(
+                "This pane shows detected vehicles, red-line markers, parking boxes, wrong-side lanes, and plate OCR results."
+            ).classes("field-hint")
+
+    def live_processing_panel() -> None:
+        with ui.card().classes("glass-card flex-1 min-w-0 preview-stage"):
+            ui.label("Live processing").classes("section-title")
+            ui.label("Exact processed frames with overlays, status, and progress from the current job.").classes("section-copy")
+
+            live_meta_strip()
+            live_preview_content()
 
             with ui.card().classes("glass-card stage-footnote w-full"):
                 ui.label("What appears here").classes("field-label")
@@ -409,9 +490,9 @@ def dashboard() -> None:
         with ui.card().classes("glass-card w-full video-shell"):
             with ui.row().classes("w-full items-center justify-between gap-3"):
                 with ui.column().classes("gap-0"):
-                    ui.label("2. Preview and live scan").classes("section-title")
+                    ui.label("2. Preview and live processing").classes("section-title")
                     ui.label(
-                        "The left pane shows the uploaded evidence, while the right pane shows the live annotated scan output."
+                        "The left pane shows the uploaded evidence, while the right pane shows the live processed frame and scan status."
                     ).classes("section-copy")
                 with ui.row().classes("items-center gap-2"):
                     if media_path := (storage.get("uploaded_media_path") or storage.get("uploaded_video_path", "")):
@@ -673,7 +754,7 @@ def dashboard() -> None:
                 if not job_manager.get_active_job():
                     cancel_btn.disable()
                 ui.button("Start webcam", icon="videocam", on_click=start_webcam_analysis).props("flat")
-                ui.button("Queue analysis", icon="play_arrow", on_click=start_upload_analysis).props("flat")
+                ui.button("Start analysis", icon="play_arrow", on_click=start_upload_analysis).props("flat")
 
     @ui.refreshable
     def settings_panel() -> None:
@@ -994,10 +1075,12 @@ def dashboard() -> None:
                 ).classes("w-full")
 
             with ui.row().classes("w-full items-center gap-2 mt-4 control-actions"):
-                ui.button("Queue analysis", icon="play_arrow", on_click=start_upload_analysis).props("unelevated color=primary")
+                ui.button("Start analysis", icon="play_arrow", on_click=start_upload_analysis).props("unelevated color=primary")
                 ui.button("Start webcam analysis", icon="videocam", on_click=start_webcam_analysis).props("flat")
+                ui.button("Apply live settings", icon="tune", on_click=apply_live_settings_to_active_job).props("flat")
                 ui.button("Cancel active job", icon="cancel", on_click=cancel_active_job).props("flat")
                 ui.button("Focus latest job", icon="visibility", on_click=focus_latest_job).props("flat")
+            ui.label("Change any control while a job is running, then press Apply live settings to update the active analysis without restarting.").classes("field-hint")
 
             if not analysis_ready:
                 ui.label("Install the optional CV packages to enable analysis buttons.").classes("field-hint")
@@ -1029,10 +1112,10 @@ def dashboard() -> None:
             with ui.tab_panel("settings"):
                 settings_panel()
 
-        ui.timer(1.2, live_processing_panel.refresh)
+        ui.timer(0.25, tick_live_preview)
 
         live_panels = [overview_panel, hotspots_panel, alerts_panel, jobs_panel, summary_strip]
-        ui.timer(4.0, lambda: [panel.refresh() for panel in live_panels])
+        ui.timer(6.0, lambda: [panel.refresh() for panel in live_panels])
 
 
 

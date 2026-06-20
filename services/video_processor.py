@@ -244,14 +244,6 @@ class VideoProcessor:
         if not fps or fps <= 0:
             fps = 25.0
 
-        start_datetime = datetime.combine(options.selected_date, options.selected_time)
-        direction_config = self._build_direction_config(options)
-        stop_line_config = {"stop_line_y": options.stop_line_y} if options.enable_signal_check else None
-        if options.enable_parking_check:
-            parking_zones = options.parking_zones or DEFAULT_PARKING_COORDS
-        else:
-            parking_zones = []
-
         frame_idx = 0
         processed_frames = 0
         violations_logged = 0
@@ -266,26 +258,40 @@ class VideoProcessor:
 
         try:
             while cap.isOpened():
-                if options.max_duration_seconds and processed_frames >= options.max_duration_seconds:
+                runtime_options = options
+                if runtime_options.max_duration_seconds and processed_frames >= runtime_options.max_duration_seconds:
                     break
                 if getattr(job, "cancel_event", None) is not None and job.cancel_event.is_set():
                     job.update_status(status="cancelled", message="Cancelled by user")
                     break
+
+                self.violation_engine.parking_violation_seconds = runtime_options.parking_violation_seconds
+                self.violation_engine.wrong_side_min_move = runtime_options.wrong_side_min_move
+                self.violation_engine.triple_overlap_ratio = runtime_options.triple_overlap_ratio
+                self.violation_engine.helmet_skin_ratio = runtime_options.helmet_skin_ratio
+
+                start_datetime = datetime.combine(runtime_options.selected_date, runtime_options.selected_time)
+                direction_config = self._build_direction_config(runtime_options)
+                stop_line_config = {"stop_line_y": runtime_options.stop_line_y} if runtime_options.enable_signal_check else None
+                if runtime_options.enable_parking_check:
+                    parking_zones = runtime_options.parking_zones or DEFAULT_PARKING_COORDS
+                else:
+                    parking_zones = []
 
                 ret, frame = cap.read()
                 if not ret:
                     break
 
                 frame_idx += 1
-                if frame_idx % max(options.frame_skip, 1) != 0:
+                if frame_idx % max(runtime_options.frame_skip, 1) != 0:
                     continue
 
-                frame = cv2.resize(frame, (options.frame_width, options.frame_height))
+                frame = cv2.resize(frame, (runtime_options.frame_width, runtime_options.frame_height))
                 elapsed_seconds = frame_idx / fps
                 current_time_str = (start_datetime + timedelta(seconds=elapsed_seconds)).strftime("%Y-%m-%d %H:%M:%S")
                 annotated, frame_violations = self._process_frame(
                     frame,
-                    options,
+                    runtime_options,
                     current_time_str=current_time_str,
                     parking_zones=parking_zones,
                     direction_config=direction_config,
@@ -299,7 +305,7 @@ class VideoProcessor:
                 else:
                     last_progress = 0.0
 
-                job.set_preview_frame(annotated, caption=f"{options.source_label or 'Video'} | {current_time_str}")
+                job.set_preview_frame(annotated, caption=f"{runtime_options.source_label or 'Video'} | {current_time_str}")
                 job.update_status(
                     message=f"Processed {processed_frames} frame(s)",
                     frames_processed=processed_frames,
@@ -307,9 +313,6 @@ class VideoProcessor:
                     progress=last_progress,
                     total_frames=total_frames,
                 )
-
-                if live:
-                    time.sleep(0.01)
 
         except Exception as exc:
             job.update_status(status="failed", message=f"Processing failed: {exc}", error=str(exc))
@@ -347,15 +350,6 @@ class VideoProcessor:
             raise ValueError(f"Could not open image: {source}")
 
         frame = cv2.resize(frame, (options.frame_width, options.frame_height))
-        start_datetime = datetime.combine(options.selected_date, options.selected_time)
-        current_time_str = start_datetime.strftime("%Y-%m-%d %H:%M:%S")
-        direction_config = self._build_direction_config(options)
-        stop_line_config = {"stop_line_y": options.stop_line_y} if options.enable_signal_check else None
-        if options.enable_parking_check:
-            parking_zones = options.parking_zones or DEFAULT_PARKING_COORDS
-        else:
-            parking_zones = []
-
         job.update_status(
             status="running",
             message=f"Processing {options.source_label or image_path.name}...",
@@ -363,15 +357,30 @@ class VideoProcessor:
             progress=0.0,
         )
 
+        runtime_options = options
+        self.violation_engine.parking_violation_seconds = runtime_options.parking_violation_seconds
+        self.violation_engine.wrong_side_min_move = runtime_options.wrong_side_min_move
+        self.violation_engine.triple_overlap_ratio = runtime_options.triple_overlap_ratio
+        self.violation_engine.helmet_skin_ratio = runtime_options.helmet_skin_ratio
+
+        start_datetime = datetime.combine(runtime_options.selected_date, runtime_options.selected_time)
+        current_time_str = start_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        direction_config = self._build_direction_config(runtime_options)
+        stop_line_config = {"stop_line_y": runtime_options.stop_line_y} if runtime_options.enable_signal_check else None
+        if runtime_options.enable_parking_check:
+            parking_zones = runtime_options.parking_zones or DEFAULT_PARKING_COORDS
+        else:
+            parking_zones = []
+
         annotated, frame_violations = self._process_frame(
             frame,
-            options,
+            runtime_options,
             current_time_str=current_time_str,
             parking_zones=parking_zones,
             direction_config=direction_config,
             stop_line_config=stop_line_config,
         )
-        job.set_preview_frame(annotated, caption=f"{options.source_label or image_path.name} | {current_time_str}")
+        job.set_preview_frame(annotated, caption=f"{runtime_options.source_label or image_path.name} | {current_time_str}")
         job.update_status(
             message="Processed 1 image",
             frames_processed=1,
