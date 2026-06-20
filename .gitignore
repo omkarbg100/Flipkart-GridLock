@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit / app artifacts
+.streamlit/
+
+# Generated runtime data
+data/*.db
+data/evidence/*
+!data/evidence/.gitkeep
+data/uploads/*
+!data/uploads/.gitkeep
+
+# Legacy demo outputs
+**/Output/*
+**/output*.avi
+**/output*.mp4
+**/output*.mkv
+
+# IDE files
+.idea/
+.vscode/
+
+# OS files
+Thumbs.db
+Desktop.ini

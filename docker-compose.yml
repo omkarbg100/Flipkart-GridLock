@@ -1,0 +1,14 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gridlock_dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["python", "app.py"]

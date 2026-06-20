@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any
+
+import pandas as pd
+import plotly.express as px
+from nicegui import ui
+
+from config.settings import MAPPLS_API_KEY
+from .helpers import dataframe_to_rows, table_columns
+
+
+def render_data_table(
+    df,
+    *,
+    pagination: int = 8,
+    row_key: str | None = None,
+    selection: str | None = None,
+    on_select: Any = None,
+    dense: bool = True,
+) -> None:
+    if df.empty:
+        ui.label("No records for the current scope.").classes("field-hint")
+        return
+
+    key = row_key or ("id" if "id" in df.columns else str(df.columns[0]))
+    props = "flat bordered"
+    if dense:
+        props += " dense"
+    table = ui.table(
+        columns=table_columns(df),
+        rows=dataframe_to_rows(df),
+        row_key=key,
+        selection=selection,
+        on_select=on_select,
+        pagination=pagination,
+    ).classes("w-full table-shell")
+    table.props(props)
+
+
+def build_pie_fig(df: pd.DataFrame, title: str, label_col: str, value_col: str, color_sequence: list[str]) -> Any:
+    if df.empty:
+        return None
+    fig = px.pie(df, names=label_col, values=value_col, hole=0.58, color_discrete_sequence=color_sequence)
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(
+        title=title,
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6eef8"),
+        legend=dict(orientation="h", y=-0.1),
+    )
+    return fig
+
+
+def build_bar_fig(df: pd.DataFrame, title: str, x_col: str, y_col: str, *, horizontal: bool = False) -> Any:
+    if df.empty:
+        return None
+    if horizontal:
+        fig = px.bar(df, x=y_col, y=x_col, orientation="h", color=y_col, color_continuous_scale=["#4d96ff", "#2dd4bf"])
+    else:
+        fig = px.bar(df, x=x_col, y=y_col, color=y_col, color_continuous_scale=["#4d96ff", "#2dd4bf"])
+    fig.update_layout(
+        title=title,
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6eef8"),
+        xaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
+        yaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
+        coloraxis_showscale=False,
+    )
+    return fig
+
+
+def build_line_fig(df: pd.DataFrame, title: str, x_col: str, y_col: str) -> Any:
+    if df.empty:
+        return None
+    fig = px.line(df, x=x_col, y=y_col, markers=True, line_shape="spline")
+    fig.update_traces(line=dict(color="#4d96ff", width=3), marker=dict(size=8, color="#2dd4bf"))
+    fig.update_layout(
+        title=title,
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6eef8"),
+        xaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
+        yaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
+    )
+    return fig
+
+
+def render_hotspot_map(cameras_df: pd.DataFrame, scope_prefix: str | None = None) -> None:
+    if cameras_df.empty:
+        ui.label("No camera coordinates available yet.").classes("field-hint")
+        return
+
+    avg_lat = float(cameras_df["latitude"].mean())
+    avg_lon = float(cameras_df["longitude"].mean())
+
+    ui.label(f"Scope: {scope_prefix or 'All time'}").classes("field-hint")
+
+    if MAPPLS_API_KEY:
+        map_id = f"mappls_hotspots_{uuid.uuid4().hex[:8]}"
+        markers = []
+        for _, row in cameras_df.iterrows():
+            lat = float(row["latitude"])
+            lon = float(row["longitude"])
+            count = int(row["count"])
+            location = str(row["location"])
+            camera_id = str(row["camera_id"])
+            if count > 10:
+                color = "#fb7185"
+            elif count > 3:
+                color = "#f4b860"
+            else:
+                color = "#2dd4bf"
+            markers.append(
+                {
+                    "lat": lat,
+                    "lng": lon,
+                    "count": count,
+                    "location": location,
+                    "camera_id": camera_id,
+                    "color": color,
+                }
+            )
+
+        ui.label("Map provider: Mappls").classes("status-chip good")
+        ui.html(f'<div id="{map_id}" class="mappls-hotspot-map"></div>').classes("w-full")
+
+        script_src = f"https://apis.mappls.com/advancedmaps/api/{MAPPLS_API_KEY}/map_sdk?v=3.0&layer=vector"
+        ui.run_javascript(
+            f"""
+            (function() {{
+              const mapId = {json.dumps(map_id)};
+              const scriptSrc = {json.dumps(script_src)};
+              const center = {json.dumps({"lat": avg_lat, "lng": avg_lon})};
+              const markers = {json.dumps(markers)};
+
+              function initMap() {{
+                const el = document.getElementById(mapId);
+                if (!el || el.dataset.gridlockMapplsReady === "1") {{
+                  return true;
+                }}
+                if (!window.mappls || !window.mappls.Map || !window.mappls.Marker) {{
+                  return false;
+                }}
+
+                el.dataset.gridlockMapplsReady = "1";
+                const map = new mappls.Map(mapId, {{ center: center, zoom: 12 }});
+                markers.forEach((item) => {{
+                  try {{
+                    new mappls.Marker({{
+                      map: map,
+                      position: {{ lat: item.lat, lng: item.lng }},
+                      title: `${{item.camera_id}} | ${{item.location}} | ${{item.count}} violations`,
+                    }});
+                  }} catch (error) {{
+                    console.error("Mappls marker render failed", error);
+                  }}
+                }});
+                return true;
+              }}
+
+              if (initMap()) {{
+                return;
+              }}
+
+              if (!document.querySelector(`script[src="${{scriptSrc}}"]`)) {{
+                const script = document.createElement("script");
+                script.src = scriptSrc;
+                script.async = true;
+                document.head.appendChild(script);
+              }}
+
+              let attempts = 0;
+              const timer = setInterval(() => {{
+                attempts += 1;
+                if (initMap() || attempts > 50) {{
+                  clearInterval(timer);
+                }}
+              }}, 200);
+            }})();
+            """
+        )
+        return
+
+    leaflet_map = ui.leaflet(center=(avg_lat, avg_lon), zoom=12).classes("w-full")
+    leaflet_map.style("height: 540px")
+    leaflet_map.tile_layer(
+        url_template="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+        options={
+            "attribution": "&copy; OpenStreetMap &copy; CartoDB",
+            "subdomains": "abcd",
+            "maxZoom": 19,
+        },
+    )
+
+    with leaflet_map:
+        for _, row in cameras_df.iterrows():
+            lat = float(row["latitude"])
+            lon = float(row["longitude"])
+            count = int(row["count"])
+            location = str(row["location"])
+            camera_id = str(row["camera_id"])
+            if count > 10:
+                color = "#fb7185"
+            elif count > 3:
+                color = "#f4b860"
+            else:
+                color = "#2dd4bf"
+
+            leaflet_map.generic_layer(
+                name="circleMarker",
+                args=[
+                    [lat, lon],
+                    {
+                        "radius": max(8, min(30, 8 + count * 2)),
+                        "color": color,
+                        "fillColor": color,
+                        "fillOpacity": 0.55,
+                        "weight": 2,
+                    },
+                ],
+            )
+            leaflet_map.marker(
+                latlng=(lat, lon),
+                options={
+                    "title": f"{camera_id} | {location} | {count} violations",
+                },
+            )
+
+
+def render_metric_card(label: str, value: Any, note: str, accent: str = "metric-blue", icon: str = "insights") -> None:
+    with ui.card().classes(f"metric-card {accent}"):
+        with ui.row().classes("items-start justify-between w-full"):
+            ui.label(label).classes("metric-label")
+            ui.icon(icon, size="1.2rem").classes("text-slate-300")
+        ui.label(str(value)).classes("metric-value")
+        ui.label(note).classes("metric-note")
+
+
+def render_slider(label: str, *, min_value: float, max_value: float, step: float, value: float) -> ui.slider:
+    with ui.column().classes("w-full gap-1"):
+        ui.label(f"{label}").classes("field-label")
+        ui.label(f"Current value: {value}").classes("field-hint")
+        slider = ui.slider(
+            min=min_value,
+            max=max_value,
+            step=step,
+            value=value,
+        ).classes("w-full")
+        return slider
+
+
+def render_toggle(label: str, options: dict[str, Any], value: Any) -> ui.toggle:
+    ui.label(label).classes("field-label")
+    toggle_options: list | dict = options
+    if isinstance(options, dict):
+        toggle_options = {stored_value: display_label for display_label, stored_value in options.items()}
+        if value not in toggle_options:
+            legacy_lookup = {display_label: stored_value for display_label, stored_value in options.items()}
+            value = legacy_lookup.get(value, next(iter(toggle_options), None))
+    return ui.toggle(toggle_options, value=value).classes("w-full")
