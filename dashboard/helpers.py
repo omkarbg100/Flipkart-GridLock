@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import uuid
 from datetime import date as date_type
@@ -143,14 +142,6 @@ def build_options_from_controls(
     else:
         raise TypeError("build_options_from_controls expects (controls, settings) or (job_manager, controls, settings)")
 
-    parking_zones_text = str(controls["parking_zones_json"].value or "").strip()
-    try:
-        parking_zones = json.loads(parking_zones_text or "[]")
-        if not isinstance(parking_zones, list):
-            raise ValueError
-    except Exception:
-        parking_zones = settings.parking_zones
-
     if job_manager is None:
         from services.runtime import get_job_manager
 
@@ -181,7 +172,7 @@ def build_options_from_controls(
         frame_skip=safe_int(controls["frame_skip"].value, settings.frame_skip),
         confidence_threshold=safe_float(controls["confidence_threshold"].value, settings.confidence_threshold),
         parking_violation_seconds=safe_float(controls["parking_violation_seconds"].value, settings.parking_violation_seconds),
-        parking_zones=parking_zones,
+        parking_zones=None,
         source_label=source_label,
     )
 
@@ -266,10 +257,11 @@ def seed_user_state(storage: dict[str, Any], settings) -> None:
         "stop_line_y": settings.stop_line_y,
         "frame_width": settings.frame_width,
         "frame_height": settings.frame_height,
-        "parking_zones_json": json.dumps(settings.parking_zones, indent=2),
     }
     for key, value in defaults.items():
         storage.setdefault(key, value)
+    storage["selected_date"] = today_prefix()
+    storage["selected_time"] = now_time_string()
 
 
 def set_control_values_from_settings(controls: dict[str, Any], settings) -> None:
@@ -289,4 +281,3 @@ def set_control_values_from_settings(controls: dict[str, Any], settings) -> None
     controls["stop_line_y"].value = settings.stop_line_y
     controls["frame_width"].value = settings.frame_width
     controls["frame_height"].value = settings.frame_height
-    controls["parking_zones_json"].value = json.dumps(settings.parking_zones, indent=2)

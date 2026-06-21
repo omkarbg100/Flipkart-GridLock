@@ -43,6 +43,7 @@ class PlateOCRReader:
             return "", 0.0
 
         gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
         h, w = gray.shape[:2]
         if w < 100:
             gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)

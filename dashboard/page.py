@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +28,7 @@ from .widgets import (
     build_bar_fig,
     build_line_fig,
     build_pie_fig,
+    VIBRANT_DARK_PIE_COLORS,
     render_data_table,
     render_hotspot_map,
     render_metric_card,
@@ -84,23 +84,46 @@ def dashboard() -> None:
         "error": "",
         "name": "",
     }
-    live_preview_state: dict[str, Any] = {"job_id": "", "seq": -1, "updated_at": 0.0}
+    live_preview_state: dict[str, Any] = {"job_id": "", "seq": -1, "updated_at": 0.0, "violations_logged": -1}
 
-    def refresh_live_sections(include_evidence: bool = False) -> None:
+    def refresh_dashboard_panels(include_evidence: bool = False) -> None:
         summary_strip.refresh()
         overview_panel.refresh()
         hotspots_panel.refresh()
         alerts_panel.refresh()
         jobs_panel.refresh()
-        refresh_live_preview(force=True)
         if include_evidence:
             evidence_panel.refresh()
+
+    def refresh_live_sections(include_evidence: bool = False) -> None:
+        refresh_dashboard_panels(include_evidence=include_evidence)
+        refresh_live_preview(force=True)
+
+    def focus_latest_evidence() -> bool:
+        scope = get_analysis_scope(storage)
+        query = str(controls.get("filter_query").value or "").strip() if controls.get("filter_query") else ""
+        violation_type = str(controls.get("filter_violation_type").value or "ALL") if controls.get("filter_violation_type") else "ALL"
+        camera_id = str(controls.get("filter_camera_id").value or "ALL") if controls.get("filter_camera_id") else "ALL"
+        latest_df = search_violations(
+            query=query,
+            violation_type=violation_type,
+            camera_id=camera_id,
+            limit=1,
+            date_prefix=scope,
+        )
+        if latest_df.empty or "id" not in latest_df.columns:
+            return False
+        latest_id = latest_df.iloc[0]["id"]
+        if latest_id in (None, ""):
+            return False
+        storage["selected_violation_id"] = latest_id
+        return True
 
     def refresh_live_preview(*, force: bool = False) -> None:
         active_job = job_manager.get_active_job()
         if not active_job:
             if force or live_preview_state["job_id"]:
-                live_preview_state.update({"job_id": "", "seq": -1, "updated_at": 0.0})
+                live_preview_state.update({"job_id": "", "seq": -1, "updated_at": 0.0, "violations_logged": -1})
                 live_meta_strip.refresh()
                 live_preview_content.refresh()
             return
@@ -109,16 +132,33 @@ def dashboard() -> None:
         job_id = str(snapshot.get("id", ""))
         preview_seq = int(snapshot.get("preview_seq", 0))
         updated_at = float(snapshot.get("updated_at", 0.0) or 0.0)
+        violations_logged = int(snapshot.get("violations_logged", 0) or 0)
+        preview_b64 = str(snapshot.get("preview_b64", "") or "")
+        job_changed = job_id != live_preview_state["job_id"]
+        seq_changed = job_changed or preview_seq != live_preview_state["seq"]
+        status_changed = updated_at != live_preview_state["updated_at"]
+        violations_changed = not job_changed and violations_logged != live_preview_state["violations_logged"]
         if (
             not force
-            and job_id == live_preview_state["job_id"]
-            and preview_seq == live_preview_state["seq"]
-            and updated_at == live_preview_state["updated_at"]
+            and not seq_changed
+            and not status_changed
+            and not violations_changed
         ):
             return
-        live_preview_state.update({"job_id": job_id, "seq": preview_seq, "updated_at": updated_at})
+        live_preview_state.update({
+            "job_id": job_id,
+            "seq": preview_seq,
+            "updated_at": updated_at,
+            "violations_logged": violations_logged,
+        })
         live_meta_strip.refresh()
-        live_preview_content.refresh()
+        if violations_changed:
+            if focus_latest_evidence():
+                refresh_dashboard_panels(include_evidence=True)
+            else:
+                refresh_dashboard_panels(include_evidence=False)
+        if force or seq_changed or (status_changed and not preview_b64):
+            live_preview_content.refresh()
 
     def tick_live_preview() -> None:
         refresh_live_preview()
@@ -251,10 +291,6 @@ def dashboard() -> None:
 
     def save_defaults_from_controls() -> None:
         try:
-            parking_zones_text = str(controls["parking_zones_json"].value or "").strip()
-            parking_zones = json.loads(parking_zones_text or "[]")
-            if not isinstance(parking_zones, list):
-                raise ValueError("Parking zones must be a JSON list")
             settings_store.update(
                 confidence_threshold=safe_float(controls["confidence_threshold"].value, settings.confidence_threshold),
                 frame_skip=safe_int(controls["frame_skip"].value, settings.frame_skip),
@@ -271,7 +307,6 @@ def dashboard() -> None:
                 right_allowed_dir=str(controls["right_allowed_dir"].value or settings.right_allowed_dir),
                 stop_line_y=safe_int(controls["stop_line_y"].value, settings.stop_line_y),
                 preprocess_profile=str(controls["preprocess_profile"].value or settings.preprocess_profile),
-                parking_zones=parking_zones,
             )
             ui.notify("Saved current analysis controls as defaults", type="positive")
             settings_panel.refresh()
@@ -556,15 +591,15 @@ def dashboard() -> None:
                 with ui.card().classes("glass-card flex-1 min-w-[300px]"):
                     ui.label("Violation mix").classes("section-title")
                     ui.label("Breakdown of the current scope by violation category.").classes("section-copy")
-                    fig = build_pie_fig(type_df, "Violation mix", "Violation Type", "Count", ["#4d96ff", "#2dd4bf", "#f4b860", "#fb7185", "#8b5cf6"])
+                    fig = build_pie_fig(type_df, "Violation mix", "Violation Type", "Count", VIBRANT_DARK_PIE_COLORS)
                     if fig is not None:
                         ui.plotly(fig).classes("w-full").style("height: 340px")
                     else:
                         ui.label("No violation mix data for this scope.").classes("field-hint")
                 with ui.card().classes("glass-card flex-1 min-w-[300px]"):
                     ui.label("Violation trend").classes("section-title")
-                    ui.label("How incidents move across the selected days.").classes("section-copy")
-                    fig = build_line_fig(trend_df, "Violations over time", "Date", "Count")
+                    ui.label("Each day is shown on the y-axis, with the violation count on the x-axis.").classes("section-copy")
+                    fig = build_line_fig(trend_df, "Violations over time", "Count", "Date")
                     if fig is not None:
                         ui.plotly(fig).classes("w-full").style("height: 340px")
                     else:
@@ -964,6 +999,7 @@ def dashboard() -> None:
                     with ui.row().classes("w-full gap-4"):
                         controls["selected_date"] = ui.date_input("Date", value=storage["selected_date"]).classes("flex-1")
                         controls["selected_time"] = ui.time_input("Start time", value=storage["selected_time"]).classes("flex-1")
+                    ui.label("Auto-filled with the current date and time when the page opens.").classes("field-hint")
 
                 with ui.card().classes("control-group"):
                     ui.label("Signal and lane logic").classes("control-group-title")
@@ -1065,15 +1101,6 @@ def dashboard() -> None:
                         controls["frame_width"] = ui.number("Frame width", value=storage["frame_width"], min=480, max=1280, step=20).classes("flex-1")
                         controls["frame_height"] = ui.number("Frame height", value=storage["frame_height"], min=320, max=900, step=20).classes("flex-1")
 
-            with ui.card().classes("control-group w-full mt-4"):
-                ui.label("Parking zones JSON").classes("control-group-title")
-                ui.label("Define the parking boxes used to detect illegal parking inside the frame.").classes("control-group-copy")
-                controls["parking_zones_json"] = ui.textarea(
-                    "Parking zones JSON",
-                    value=storage["parking_zones_json"],
-                    placeholder="[[36, 295, 169, 346], ...]",
-                ).classes("w-full")
-
             with ui.row().classes("w-full items-center gap-2 mt-4 control-actions"):
                 ui.button("Start analysis", icon="play_arrow", on_click=start_upload_analysis).props("unelevated color=primary")
                 ui.button("Start webcam analysis", icon="videocam", on_click=start_webcam_analysis).props("flat")
@@ -1081,6 +1108,7 @@ def dashboard() -> None:
                 ui.button("Cancel active job", icon="cancel", on_click=cancel_active_job).props("flat")
                 ui.button("Focus latest job", icon="visibility", on_click=focus_latest_job).props("flat")
             ui.label("Change any control while a job is running, then press Apply live settings to update the active analysis without restarting.").classes("field-hint")
+            ui.label("Parking zones are inferred automatically from the uploaded media, so no manual zone boxes are needed.").classes("field-hint")
 
             if not analysis_ready:
                 ui.label("Install the optional CV packages to enable analysis buttons.").classes("field-hint")
@@ -1112,7 +1140,7 @@ def dashboard() -> None:
             with ui.tab_panel("settings"):
                 settings_panel()
 
-        ui.timer(0.25, tick_live_preview)
+        ui.timer(0.15, tick_live_preview)
 
         live_panels = [overview_panel, hotspots_panel, alerts_panel, jobs_panel, summary_strip]
         ui.timer(6.0, lambda: [panel.refresh() for panel in live_panels])

@@ -189,10 +189,37 @@ class ViolationEngine:
                 # If person area is at least 30% inside the motorcycle box, count them as riding
                 if person_area > 0 and (overlap_area / person_area) > self.triple_overlap_ratio:
                     count += 1
-                    
+
         return count >= 3
 
-    def detect_helmet_violation(self, frame, person_box):
+    def _helmet_region(self, frame, person_box, motorcycle_box=None):
+        if cv2 is None or np is None or frame is None:
+            return None
+
+        px1, py1, px2, py2 = person_box
+        h = max(1, py2 - py1)
+        w = max(1, px2 - px1)
+
+        head_x1 = max(0, px1)
+        head_x2 = min(frame.shape[1], px2)
+        head_y1 = max(0, py1)
+        head_y2 = min(frame.shape[0], py1 + max(8, int(h * 0.24)))
+
+        if motorcycle_box is not None and (head_y2 <= head_y1 or head_x2 <= head_x1):
+            mx1, my1, mx2, my2 = motorcycle_box
+            motor_h = max(1, my2 - my1)
+            motor_w = max(1, mx2 - mx1)
+            head_x1 = max(0, mx1 + int(motor_w * 0.08))
+            head_x2 = min(frame.shape[1], mx2 - int(motor_w * 0.08))
+            head_y1 = max(0, my1 - int(motor_h * 0.05))
+            head_y2 = min(frame.shape[0], my1 + int(motor_h * 0.38))
+
+        if head_y2 <= head_y1 or head_x2 <= head_x1:
+            return None
+
+        return frame[head_y1:head_y2, head_x1:head_x2]
+
+    def detect_helmet_violation(self, frame, person_box, motorcycle_box=None):
         """Simple computer vision heuristic for helmet detection.
         Crops head region (top 20% of person bounding box) and checks for
         color contrast/edge density or skin vs solid helmet textures.
@@ -200,19 +227,8 @@ class ViolationEngine:
         if cv2 is None or np is None or frame is None:
             return False
 
-        px1, py1, px2, py2 = person_box
-        h = py2 - py1
-        w = px2 - px1
-        
-        # Crop head region
-        hx1, hy1 = px1, py1
-        hx2, hy2 = px2, py1 + int(h * 0.22)
-        
-        if hy2 <= hy1 or hx2 <= hx1:
-            return False # Fallback: assume no violation
-            
-        head_crop = frame[hy1:hy2, hx1:hx2]
-        if head_crop.size == 0:
+        head_crop = self._helmet_region(frame, person_box, motorcycle_box=motorcycle_box)
+        if head_crop is None or head_crop.size == 0:
             return False
 
         # Convert to HSV for skin color detection
@@ -320,7 +336,7 @@ class ViolationEngine:
         tracked_boxes = self.tracker.update(tracker_input)
         
         # 1. Check Illegal Parking
-        zones = parking_zones if parking_zones else DEFAULT_PARKING_COORDS
+        zones = DEFAULT_PARKING_COORDS if parking_zones is None else parking_zones
         for obj_id, box in tracked_boxes.items():
             cls = self.tracker.classes[obj_id]
             if cls in ["car", "truck", "bus"]:
@@ -370,7 +386,7 @@ class ViolationEngine:
             # Check Helmets for each rider
             no_helmet_detected = False
             for rider in riders:
-                if self.detect_helmet_violation(frame, rider):
+                if self.detect_helmet_violation(frame, rider, motorcycle_box=m_box):
                     no_helmet_detected = True
                     break
             

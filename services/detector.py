@@ -106,7 +106,15 @@ class TrafficDetector:
         if frame is None:
             return []
 
-        results = self.model(frame, verbose=False, conf=conf_threshold)[0]
+        results = self.model(
+            frame,
+            verbose=False,
+            conf=conf_threshold,
+            imgsz=640,
+            classes=list(self.target_classes.keys()),
+            device=self.device,
+            half=self.device == "cuda",
+        )[0]
 
         detections = []
         for box in results.boxes:

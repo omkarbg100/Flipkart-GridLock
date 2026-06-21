@@ -62,6 +62,7 @@ class VideoProcessor:
         self.detector = detector or TrafficDetector()
         self.ocr_reader = ocr_reader or PlateOCRReader.get_instance()
         self.violation_engine = violation_engine or ViolationEngine()
+        self._motion_subtractor = None
 
     def dependency_status(self) -> dict[str, Any]:
         detector_available = getattr(self.detector, "available", False)
@@ -102,6 +103,216 @@ class VideoProcessor:
             "right_allowed_dir": options.right_allowed_dir,
         }
 
+    def _prepare_runtime_context(
+        self,
+        options: AnalysisOptions,
+    ) -> tuple[datetime, Optional[dict[str, str]], Optional[dict[str, int]]]:
+        self.violation_engine.parking_violation_seconds = options.parking_violation_seconds
+        self.violation_engine.wrong_side_min_move = options.wrong_side_min_move
+        self.violation_engine.triple_overlap_ratio = options.triple_overlap_ratio
+        self.violation_engine.helmet_skin_ratio = options.helmet_skin_ratio
+
+        start_datetime = datetime.combine(options.selected_date, options.selected_time)
+        direction_config = self._build_direction_config(options)
+        stop_line_config = {"stop_line_y": options.stop_line_y} if options.enable_signal_check else None
+        return start_datetime, direction_config, stop_line_config
+
+    @staticmethod
+    def _read_capture_frame(cap, frame_skip: int):
+        step = max(int(frame_skip), 1)
+        if step == 1:
+            ret, frame = cap.read()
+            return ret, frame, 1 if ret else 0
+
+        frames_advanced = 0
+        for _ in range(step - 1):
+            if not cap.grab():
+                return False, None, frames_advanced
+            frames_advanced += 1
+
+        ret, frame = cap.retrieve()
+        if ret:
+            frames_advanced += 1
+        return ret, frame, frames_advanced
+
+    def _reset_motion_subtractor(self) -> None:
+        if cv2 is None:
+            self._motion_subtractor = None
+            return
+        self._motion_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=120,
+            varThreshold=24,
+            detectShadows=False,
+        )
+
+    def _motion_activity_ratio(self, frame) -> float:
+        if cv2 is None or frame is None:
+            return 1.0
+        if self._motion_subtractor is None:
+            self._reset_motion_subtractor()
+        if self._motion_subtractor is None:
+            return 1.0
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        mask = self._motion_subtractor.apply(gray, learningRate=0.003)
+        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        active_pixels = cv2.countNonZero(mask)
+        total_pixels = mask.shape[0] * mask.shape[1]
+        if total_pixels <= 0:
+            return 1.0
+        return active_pixels / float(total_pixels)
+
+    @staticmethod
+    def _count_grid_to_zones(counts: list[list[int]], frame_shape, *, max_zones: int = 6) -> list[list[int]]:
+        if not counts or not frame_shape:
+            return []
+
+        height, width = frame_shape[:2]
+        if height <= 0 or width <= 0:
+            return []
+
+        grid_rows = len(counts)
+        grid_cols = len(counts[0]) if counts[0] else 0
+        if grid_rows <= 0 or grid_cols <= 0:
+            return []
+
+        flattened = [(int(score), row, col) for row, row_values in enumerate(counts) for col, score in enumerate(row_values)]
+        total_hits = sum(score for score, _, _ in flattened)
+        if total_hits <= 0:
+            return []
+
+        threshold = max(2, total_hits // 6)
+        selected = {(row, col) for score, row, col in flattened if score >= threshold}
+        if not selected:
+            ranked = sorted(flattened, key=lambda item: item[0], reverse=True)
+            selected = {(row, col) for score, row, col in ranked[:max_zones] if score > 0}
+
+        def cell_bounds(row: int, col: int) -> tuple[int, int, int, int]:
+            x1 = int(col * width / grid_cols)
+            x2 = int((col + 1) * width / grid_cols)
+            y1 = int(row * height / grid_rows)
+            y2 = int((row + 1) * height / grid_rows)
+            return x1, y1, x2, y2
+
+        visited: set[tuple[int, int]] = set()
+        zones: list[list[int]] = []
+        for start in sorted(selected):
+            if start in visited:
+                continue
+            queue = [start]
+            visited.add(start)
+            members: list[tuple[int, int]] = []
+            while queue:
+                row, col = queue.pop()
+                members.append((row, col))
+                for d_row, d_col in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    neighbor = (row + d_row, col + d_col)
+                    if neighbor in selected and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+
+            x1 = width
+            y1 = height
+            x2 = 0
+            y2 = 0
+            for row, col in members:
+                cell_x1, cell_y1, cell_x2, cell_y2 = cell_bounds(row, col)
+                x1 = min(x1, cell_x1)
+                y1 = min(y1, cell_y1)
+                x2 = max(x2, cell_x2)
+                y2 = max(y2, cell_y2)
+
+            pad_x = max(12, int(width * 0.03))
+            pad_y = max(12, int(height * 0.03))
+            zone = [
+                max(0, x1 - pad_x),
+                max(0, y1 - pad_y),
+                min(width, x2 + pad_x),
+                min(height, y2 + pad_y),
+            ]
+            if zone[2] > zone[0] and zone[3] > zone[1]:
+                zones.append(zone)
+            if len(zones) >= max_zones:
+                break
+
+        return zones
+
+    def _infer_parking_zones_from_frames(self, frames: list, options: AnalysisOptions) -> list[list[int]]:
+        if cv2 is None or not frames:
+            return []
+
+        grid_rows = 3
+        grid_cols = 4
+        counts = [[0 for _ in range(grid_cols)] for _ in range(grid_rows)]
+        frame_shape = None
+        detection_conf = max(0.20, min(0.55, options.confidence_threshold * 0.85))
+        parking_classes = {"car", "truck", "bus", "motorcycle"}
+
+        for frame in frames:
+            if frame is None:
+                continue
+
+            working = cv2.resize(frame, (options.frame_width, options.frame_height))
+            frame_shape = working.shape
+            analysis_frame = self._apply_preprocessing(working, options)
+            if analysis_frame is None:
+                analysis_frame = working
+
+            try:
+                detections = self.detector.detect_frame(analysis_frame, conf_threshold=detection_conf)
+            except Exception:
+                continue
+
+            height, width = analysis_frame.shape[:2]
+            if height <= 0 or width <= 0:
+                continue
+
+            for detection in detections:
+                if detection.get("class_name") not in parking_classes:
+                    continue
+
+                x1, y1, x2, y2 = detection["box"]
+                center_x = max(0, min(width - 1, int((x1 + x2) / 2)))
+                center_y = max(0, min(height - 1, int((y1 + y2) / 2)))
+                col = min(grid_cols - 1, (center_x * grid_cols) // max(width, 1))
+                row = min(grid_rows - 1, (center_y * grid_rows) // max(height, 1))
+                counts[row][col] += 1
+
+        if frame_shape is None:
+            frame_shape = (options.frame_height, options.frame_width, 3)
+
+        return self._count_grid_to_zones(counts, frame_shape)
+
+    def _infer_parking_zones_from_capture(self, cap, options: AnalysisOptions, *, live: bool = False) -> list[list[int]]:
+        if cv2 is None or cap is None:
+            return []
+
+        sampled_frames = []
+        for _ in range(8):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            sampled_frames.append(frame)
+
+        if not live:
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            except Exception:
+                pass
+
+        zones = self._infer_parking_zones_from_frames(sampled_frames, options)
+        if zones:
+            options.parking_zones = zones
+            return zones
+
+        fallback = [zone.copy() for zone in DEFAULT_PARKING_COORDS]
+        options.parking_zones = fallback
+        return fallback
+
     @staticmethod
     def _encode_preview(frame) -> str:
         ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -132,12 +343,16 @@ class VideoProcessor:
         parking_zones,
         direction_config,
         stop_line_config,
+        analysis_frame=None,
+        detections=None,
     ) -> tuple[Any, int]:
-        analysis_frame = self._apply_preprocessing(frame, options)
+        if analysis_frame is None:
+            analysis_frame = self._apply_preprocessing(frame, options)
         if analysis_frame is None:
             analysis_frame = frame
 
-        detections = self.detector.detect_frame(analysis_frame, conf_threshold=options.confidence_threshold)
+        if detections is None:
+            detections = self.detector.detect_frame(analysis_frame, conf_threshold=options.confidence_threshold)
         violations = self.violation_engine.process_violations(
             frame=analysis_frame,
             detections=detections,
@@ -230,14 +445,16 @@ class VideoProcessor:
         self.ensure_ready()
         add_camera_if_not_exists(options.camera_id, options.location_name, options.lat_coord, options.lon_coord)
         self.violation_engine.reset()
-        self.violation_engine.parking_violation_seconds = options.parking_violation_seconds
-        self.violation_engine.wrong_side_min_move = options.wrong_side_min_move
-        self.violation_engine.triple_overlap_ratio = options.triple_overlap_ratio
-        self.violation_engine.helmet_skin_ratio = options.helmet_skin_ratio
 
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
             raise ValueError(f"Could not open source: {source}")
+
+        if live:
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not live else 0
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -256,39 +473,61 @@ class VideoProcessor:
             progress=0.0,
         )
 
+        self._reset_motion_subtractor()
+        parking_zones_cache = self._infer_parking_zones_from_capture(cap, options, live=live) if options.enable_parking_check else []
+        cached_detections: list[dict] = []
+        frames_since_detection = 0
+        last_annotated = None
+        last_caption = ""
+
         try:
             while cap.isOpened():
-                runtime_options = options
+                runtime_options = getattr(job, "options", None) or options
                 if runtime_options.max_duration_seconds and processed_frames >= runtime_options.max_duration_seconds:
                     break
                 if getattr(job, "cancel_event", None) is not None and job.cancel_event.is_set():
                     job.update_status(status="cancelled", message="Cancelled by user")
                     break
 
-                self.violation_engine.parking_violation_seconds = runtime_options.parking_violation_seconds
-                self.violation_engine.wrong_side_min_move = runtime_options.wrong_side_min_move
-                self.violation_engine.triple_overlap_ratio = runtime_options.triple_overlap_ratio
-                self.violation_engine.helmet_skin_ratio = runtime_options.helmet_skin_ratio
-
-                start_datetime = datetime.combine(runtime_options.selected_date, runtime_options.selected_time)
-                direction_config = self._build_direction_config(runtime_options)
-                stop_line_config = {"stop_line_y": runtime_options.stop_line_y} if runtime_options.enable_signal_check else None
-                if runtime_options.enable_parking_check:
-                    parking_zones = runtime_options.parking_zones or DEFAULT_PARKING_COORDS
-                else:
-                    parking_zones = []
-
-                ret, frame = cap.read()
+                start_datetime, direction_config, stop_line_config = self._prepare_runtime_context(runtime_options)
+                ret, frame, advanced_frames = self._read_capture_frame(cap, runtime_options.frame_skip)
                 if not ret:
                     break
 
-                frame_idx += 1
-                if frame_idx % max(runtime_options.frame_skip, 1) != 0:
-                    continue
+                frame_idx += advanced_frames
 
                 frame = cv2.resize(frame, (runtime_options.frame_width, runtime_options.frame_height))
                 elapsed_seconds = frame_idx / fps
                 current_time_str = (start_datetime + timedelta(seconds=elapsed_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+                if runtime_options.enable_parking_check:
+                    parking_zones = runtime_options.parking_zones or parking_zones_cache
+                else:
+                    parking_zones = []
+
+                analysis_frame = self._apply_preprocessing(frame, runtime_options)
+                if analysis_frame is None:
+                    analysis_frame = frame
+
+                motion_ratio = self._motion_activity_ratio(frame)
+                frame_skip_value = max(1, int(runtime_options.frame_skip))
+                detection_refresh_interval = max(2, min(6, frame_skip_value // 2))
+                should_refresh_detections = (
+                    not cached_detections
+                    or frames_since_detection >= detection_refresh_interval
+                    or motion_ratio >= 0.018
+                )
+                if should_refresh_detections:
+                    try:
+                        cached_detections = self.detector.detect_frame(
+                            analysis_frame,
+                            conf_threshold=runtime_options.confidence_threshold,
+                        )
+                    except Exception:
+                        cached_detections = []
+                    frames_since_detection = 0
+                else:
+                    frames_since_detection += 1
+
                 annotated, frame_violations = self._process_frame(
                     frame,
                     runtime_options,
@@ -296,8 +535,12 @@ class VideoProcessor:
                     parking_zones=parking_zones,
                     direction_config=direction_config,
                     stop_line_config=stop_line_config,
+                    analysis_frame=analysis_frame,
+                    detections=cached_detections,
                 )
                 violations_logged += frame_violations
+                last_annotated = annotated
+                last_caption = f"{runtime_options.source_label or 'Video'} | {current_time_str}"
 
                 processed_frames += 1
                 if total_frames > 0 and not live:
@@ -305,7 +548,7 @@ class VideoProcessor:
                 else:
                     last_progress = 0.0
 
-                job.set_preview_frame(annotated, caption=f"{runtime_options.source_label or 'Video'} | {current_time_str}")
+                job.set_preview_frame(annotated, caption=last_caption)
                 job.update_status(
                     message=f"Processed {processed_frames} frame(s)",
                     frames_processed=processed_frames,
@@ -319,6 +562,9 @@ class VideoProcessor:
             raise
         finally:
             cap.release()
+
+        if last_annotated is not None:
+            job.set_preview_frame(last_annotated, caption=last_caption, force=True)
 
         summary = get_counts_summary()
         recent_violations = get_recent_violations(limit=25).to_dict(orient="records")
@@ -357,18 +603,17 @@ class VideoProcessor:
             progress=0.0,
         )
 
-        runtime_options = options
-        self.violation_engine.parking_violation_seconds = runtime_options.parking_violation_seconds
-        self.violation_engine.wrong_side_min_move = runtime_options.wrong_side_min_move
-        self.violation_engine.triple_overlap_ratio = runtime_options.triple_overlap_ratio
-        self.violation_engine.helmet_skin_ratio = runtime_options.helmet_skin_ratio
-
-        start_datetime = datetime.combine(runtime_options.selected_date, runtime_options.selected_time)
+        runtime_options = getattr(job, "options", None) or options
+        start_datetime, direction_config, stop_line_config = self._prepare_runtime_context(runtime_options)
         current_time_str = start_datetime.strftime("%Y-%m-%d %H:%M:%S")
-        direction_config = self._build_direction_config(runtime_options)
-        stop_line_config = {"stop_line_y": runtime_options.stop_line_y} if runtime_options.enable_signal_check else None
+        analysis_frame = self._apply_preprocessing(frame, runtime_options)
+        if analysis_frame is None:
+            analysis_frame = frame
         if runtime_options.enable_parking_check:
-            parking_zones = runtime_options.parking_zones or DEFAULT_PARKING_COORDS
+            parking_zones = runtime_options.parking_zones or self._infer_parking_zones_from_frames([analysis_frame], runtime_options)
+            if not parking_zones:
+                parking_zones = [zone.copy() for zone in DEFAULT_PARKING_COORDS]
+            runtime_options.parking_zones = parking_zones
         else:
             parking_zones = []
 
@@ -379,8 +624,9 @@ class VideoProcessor:
             parking_zones=parking_zones,
             direction_config=direction_config,
             stop_line_config=stop_line_config,
+            analysis_frame=analysis_frame,
         )
-        job.set_preview_frame(annotated, caption=f"{runtime_options.source_label or image_path.name} | {current_time_str}")
+        job.set_preview_frame(annotated, caption=f"{runtime_options.source_label or image_path.name} | {current_time_str}", force=True)
         job.update_status(
             message="Processed 1 image",
             frames_processed=1,

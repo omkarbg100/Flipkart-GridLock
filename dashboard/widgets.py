@@ -11,6 +11,45 @@ from nicegui import ui
 from config.settings import MAPPLS_API_KEY
 from .helpers import dataframe_to_rows, table_columns
 
+VIBRANT_DARK_PIE_COLORS = [
+    "#991b1b",
+    "#ef4444",
+    "#f97316",
+    "#f59e0b",
+    "#84cc16",
+    "#22c55e",
+    "#10b981",
+    "#06b6d4",
+    "#8b5cf6",
+]
+VIBRANT_DARK_CONTINUOUS = [
+    "#7f1d1d",
+    "#b91c1c",
+    "#ef4444",
+    "#f97316",
+    "#facc15",
+    "#84cc16",
+    "#22c55e",
+]
+DARK_PANEL_BG = "rgba(5, 10, 18, 0.96)"
+DARK_GRID = "rgba(148, 163, 184, 0.18)"
+DARK_TEXT = "#f8fafc"
+
+
+def _apply_dark_layout(fig: Any, title: str) -> Any:
+    fig.update_layout(
+        title=title,
+        margin=dict(l=10, r=10, t=44, b=10),
+        paper_bgcolor=DARK_PANEL_BG,
+        plot_bgcolor=DARK_PANEL_BG,
+        font=dict(color=DARK_TEXT),
+        colorway=VIBRANT_DARK_PIE_COLORS,
+        legend=dict(font=dict(color=DARK_TEXT)),
+    )
+    fig.update_xaxes(gridcolor=DARK_GRID, zerolinecolor=DARK_GRID, tickfont=dict(color=DARK_TEXT))
+    fig.update_yaxes(gridcolor=DARK_GRID, zerolinecolor=DARK_GRID, tickfont=dict(color=DARK_TEXT))
+    return fig
+
 
 def render_data_table(
     df,
@@ -45,14 +84,8 @@ def build_pie_fig(df: pd.DataFrame, title: str, label_col: str, value_col: str, 
         return None
     fig = px.pie(df, names=label_col, values=value_col, hole=0.58, color_discrete_sequence=color_sequence)
     fig.update_traces(textposition="inside", textinfo="percent+label")
-    fig.update_layout(
-        title=title,
-        margin=dict(l=10, r=10, t=40, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e6eef8"),
-        legend=dict(orientation="h", y=-0.1),
-    )
+    fig.update_layout(legend=dict(orientation="h", y=-0.1, font=dict(color=DARK_TEXT)))
+    _apply_dark_layout(fig, title)
     return fig
 
 
@@ -60,19 +93,11 @@ def build_bar_fig(df: pd.DataFrame, title: str, x_col: str, y_col: str, *, horiz
     if df.empty:
         return None
     if horizontal:
-        fig = px.bar(df, x=y_col, y=x_col, orientation="h", color=y_col, color_continuous_scale=["#4d96ff", "#2dd4bf"])
+        fig = px.bar(df, x=y_col, y=x_col, orientation="h", color=y_col, color_continuous_scale=VIBRANT_DARK_CONTINUOUS)
     else:
-        fig = px.bar(df, x=x_col, y=y_col, color=y_col, color_continuous_scale=["#4d96ff", "#2dd4bf"])
-    fig.update_layout(
-        title=title,
-        margin=dict(l=10, r=10, t=40, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e6eef8"),
-        xaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
-        yaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
-        coloraxis_showscale=False,
-    )
+        fig = px.bar(df, x=x_col, y=y_col, color=y_col, color_continuous_scale=VIBRANT_DARK_CONTINUOUS)
+    fig.update_layout(coloraxis_showscale=False)
+    _apply_dark_layout(fig, title)
     return fig
 
 
@@ -80,16 +105,11 @@ def build_line_fig(df: pd.DataFrame, title: str, x_col: str, y_col: str) -> Any:
     if df.empty:
         return None
     fig = px.line(df, x=x_col, y=y_col, markers=True, line_shape="spline")
-    fig.update_traces(line=dict(color="#4d96ff", width=3), marker=dict(size=8, color="#2dd4bf"))
-    fig.update_layout(
-        title=title,
-        margin=dict(l=10, r=10, t=40, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e6eef8"),
-        xaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
-        yaxis=dict(gridcolor="rgba(148,163,184,0.12)"),
+    fig.update_traces(
+        line=dict(color="#22c55e", width=3.5),
+        marker=dict(size=8, color="#ef4444", line=dict(color="#f8fafc", width=1)),
     )
+    _apply_dark_layout(fig, title)
     return fig
 
 
@@ -245,15 +265,29 @@ def render_metric_card(label: str, value: Any, note: str, accent: str = "metric-
 
 
 def render_slider(label: str, *, min_value: float, max_value: float, step: float, value: float) -> ui.slider:
+    def format_value(current: float) -> str:
+        try:
+            return f"{float(current):g}"
+        except Exception:
+            return str(current)
+
     with ui.column().classes("w-full gap-1"):
-        ui.label(f"{label}").classes("field-label")
-        ui.label(f"Current value: {value}").classes("field-hint")
+        with ui.row().classes("w-full items-center justify-between gap-3"):
+            ui.label(label).classes("field-label")
+            value_label = ui.label(f"Selected: {format_value(value)}").classes("field-hint")
+
         slider = ui.slider(
             min=min_value,
             max=max_value,
             step=step,
             value=value,
         ).classes("w-full")
+
+        def sync_value(event) -> None:
+            current = getattr(event, "value", slider.value)
+            value_label.set_text(f"Selected: {format_value(current)}")
+
+        slider.on("update:model-value", sync_value)
         return slider
 
 

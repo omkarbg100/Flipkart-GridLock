@@ -38,6 +38,7 @@ class DashboardJob:
     preview_b64: str = ""
     preview_caption: str = ""
     preview_seq: int = 0
+    preview_updated_at: float = 0.0
     error: str = ""
     result: dict = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -52,11 +53,23 @@ class DashboardJob:
             if self.status in {"completed", "cancelled", "failed"} and self.finished_at is None:
                 self.finished_at = self.updated_at
 
-    def set_preview_frame(self, frame, caption: str = "") -> None:
+    def set_preview_frame(self, frame, caption: str = "", *, force: bool = False) -> None:
         if cv2 is None or frame is None:
             return
 
-        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        now = time.time()
+        preview_frame = frame
+        max_width = 960
+        if frame.shape[1] > max_width:
+            scale = max_width / float(frame.shape[1])
+            new_size = (max_width, max(1, int(frame.shape[0] * scale)))
+            preview_frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+        with self.lock:
+            if not force and self.preview_b64 and (now - self.preview_updated_at) < 0.12:
+                return
+
+        ok, encoded = cv2.imencode(".jpg", preview_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if not ok:
             return
 
@@ -64,7 +77,8 @@ class DashboardJob:
             self.preview_b64 = base64.b64encode(encoded.tobytes()).decode("utf-8")
             self.preview_caption = caption
             self.preview_seq += 1
-            self.updated_at = time.time()
+            self.preview_updated_at = now
+            self.updated_at = now
 
     def apply_options(self, updates: AnalysisOptions) -> bool:
         if self.options is None:
@@ -98,6 +112,7 @@ class DashboardJob:
                 "preview_b64": self.preview_b64,
                 "preview_caption": self.preview_caption,
                 "preview_seq": self.preview_seq,
+                "preview_updated_at": self.preview_updated_at,
             }
 
 
@@ -136,11 +151,13 @@ class JobManager:
 
     def get_active_job(self) -> Optional[DashboardJob]:
         with self._lock:
-            running = [job for job in self._jobs.values() if job.status in {"queued", "running"}]
-        if not running:
+            running = [job for job in self._jobs.values() if job.status == "running"]
+            queued = [job for job in self._jobs.values() if job.status == "queued"]
+        candidates = running or queued
+        if not candidates:
             return None
-        running.sort(key=lambda job: job.started_at, reverse=True)
-        return running[0]
+        candidates.sort(key=lambda job: job.started_at, reverse=True)
+        return candidates[0]
 
     def latest_snapshot(self) -> Optional[dict]:
         active = self.get_active_job()
@@ -277,7 +294,7 @@ class JobManager:
             wrong_side_min_move=settings.wrong_side_min_move,
             triple_overlap_ratio=settings.triple_overlap_ratio,
             helmet_skin_ratio=settings.helmet_skin_ratio,
-            parking_zones=parking_zones if parking_zones is not None else settings.parking_zones,
+            parking_zones=parking_zones,
             source_label=source_label,
             preprocess_profile=preprocess_profile if preprocess_profile else settings.preprocess_profile,
         )
