@@ -84,7 +84,12 @@ def dashboard() -> None:
         "error": "",
         "name": "",
     }
-    live_preview_state: dict[str, Any] = {"job_id": "", "seq": -1, "updated_at": 0.0, "violations_logged": -1}
+    live_preview_state: dict[str, Any] = {
+        "job_id": "",
+        "seq": -1,
+        "status": "",
+        "violations_logged": -1,
+    }
 
     def resolve_dashboard_scope() -> tuple[str | None, bool, str | None, str | None]:
         selected_scope = get_analysis_scope(storage)
@@ -165,13 +170,13 @@ def dashboard() -> None:
         else:
             snapshot = get_demo_bundle(get_analysis_scope(storage)).live_snapshot
         job_id = str(snapshot.get("id", ""))
+        status = str(snapshot.get("status", "") or "")
         preview_seq = int(snapshot.get("preview_seq", 0))
-        updated_at = float(snapshot.get("updated_at", 0.0) or 0.0)
         violations_logged = int(snapshot.get("violations_logged", 0) or 0)
         preview_b64 = str(snapshot.get("preview_b64", "") or "")
         job_changed = job_id != live_preview_state["job_id"]
         seq_changed = job_changed or preview_seq != live_preview_state["seq"]
-        status_changed = updated_at != live_preview_state["updated_at"]
+        status_changed = status != live_preview_state["status"]
         violations_changed = not job_changed and violations_logged != live_preview_state["violations_logged"]
         if (
             not force
@@ -183,12 +188,11 @@ def dashboard() -> None:
         live_preview_state.update({
             "job_id": job_id,
             "seq": preview_seq,
-            "updated_at": updated_at,
+            "status": status,
             "violations_logged": violations_logged,
         })
         live_meta_strip.refresh()
         if not active_job:
-            refresh_dashboard_panels(include_evidence=True)
             live_preview_content.refresh()
             return
         if violations_changed:
@@ -200,7 +204,8 @@ def dashboard() -> None:
             live_preview_content.refresh()
 
     def tick_live_preview() -> None:
-        refresh_live_preview()
+        if job_manager.get_active_job():
+            refresh_live_preview()
 
     async def handle_upload(event) -> None:
         try:
@@ -1379,10 +1384,7 @@ def dashboard() -> None:
             with ui.tab_panel("settings"):
                 settings_panel()
 
-        ui.timer(0.15, tick_live_preview)
-
-        live_panels = [overview_panel, hotspots_panel, alerts_panel, jobs_panel, summary_strip]
-        ui.timer(6.0, lambda: [panel.refresh() for panel in live_panels])
+        ui.timer(0.8, tick_live_preview)
 
 
 
