@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 import pandas as pd
@@ -24,6 +25,7 @@ from .helpers import (
     today_prefix,
 )
 from .theme import APP_CSS, FONT_LINKS, PAGE_TITLE
+from .demo_data import get_demo_bundle
 from .widgets import (
     build_bar_fig,
     build_line_fig,
@@ -38,7 +40,6 @@ from .widgets import (
 from services.evaluation import load_benchmark_package, summarize_benchmark
 from services.db_service import (
     add_camera_if_not_exists,
-    clear_database,
     get_camera_wise_violations,
     get_cameras_with_density,
     get_counts_summary,
@@ -76,7 +77,6 @@ def dashboard() -> None:
 
     controls: dict[str, Any] = {}
     camera_form: dict[str, Any] = {}
-    clear_confirm: dict[str, Any] = {}
     benchmark_state: dict[str, Any] = {
         "summary": None,
         "ground_truth": None,
@@ -85,6 +85,38 @@ def dashboard() -> None:
         "name": "",
     }
     live_preview_state: dict[str, Any] = {"job_id": "", "seq": -1, "updated_at": 0.0, "violations_logged": -1}
+
+    def resolve_dashboard_scope() -> tuple[str | None, bool, str | None, str | None]:
+        selected_scope = get_analysis_scope(storage)
+        selected_total = get_counts_summary(date_prefix=selected_scope)["total"]
+        if selected_total > 0:
+            return selected_scope, False, None, selected_scope or "All time"
+
+        all_total = get_counts_summary()["total"]
+        if all_total > 0:
+            return None, False, "No records match the selected date, so showing all available evidence.", "All time"
+
+        return selected_scope, True, "Demo data is shown because the database is empty.", selected_scope or "All time"
+
+    def latest_real_evidence_path(scope: str | None) -> Path | None:
+        df = search_violations(limit=1, date_prefix=scope)
+        if df.empty and scope is not None:
+            df = search_violations(limit=1)
+        if df.empty or "Evidence" not in df.columns:
+            return None
+        evidence_value = str(df.iloc[0].get("Evidence", "") or "").strip()
+        if not evidence_value or evidence_value.startswith("demo:"):
+            return None
+        path = Path(evidence_value)
+        return path if path.exists() else None
+
+    def latest_violation_row(scope: str | None) -> dict[str, Any] | None:
+        df = search_violations(limit=1, date_prefix=scope)
+        if df.empty and scope is not None:
+            df = search_violations(limit=1)
+        if df.empty:
+            return None
+        return df.iloc[0].to_dict()
 
     def refresh_dashboard_panels(include_evidence: bool = False) -> None:
         summary_strip.refresh()
@@ -100,7 +132,7 @@ def dashboard() -> None:
         refresh_live_preview(force=True)
 
     def focus_latest_evidence() -> bool:
-        scope = get_analysis_scope(storage)
+        scope, use_demo, _, _ = resolve_dashboard_scope()
         query = str(controls.get("filter_query").value or "").strip() if controls.get("filter_query") else ""
         violation_type = str(controls.get("filter_violation_type").value or "ALL") if controls.get("filter_violation_type") else "ALL"
         camera_id = str(controls.get("filter_camera_id").value or "ALL") if controls.get("filter_camera_id") else "ALL"
@@ -111,6 +143,13 @@ def dashboard() -> None:
             limit=1,
             date_prefix=scope,
         )
+        if latest_df.empty and not use_demo:
+            latest_df = search_violations(
+                query=query,
+                violation_type=violation_type,
+                camera_id=camera_id,
+                limit=1,
+            )
         if latest_df.empty or "id" not in latest_df.columns:
             return False
         latest_id = latest_df.iloc[0]["id"]
@@ -121,14 +160,10 @@ def dashboard() -> None:
 
     def refresh_live_preview(*, force: bool = False) -> None:
         active_job = job_manager.get_active_job()
-        if not active_job:
-            if force or live_preview_state["job_id"]:
-                live_preview_state.update({"job_id": "", "seq": -1, "updated_at": 0.0, "violations_logged": -1})
-                live_meta_strip.refresh()
-                live_preview_content.refresh()
-            return
-
-        snapshot = active_job.snapshot()
+        if active_job:
+            snapshot = active_job.snapshot()
+        else:
+            snapshot = get_demo_bundle(get_analysis_scope(storage)).live_snapshot
         job_id = str(snapshot.get("id", ""))
         preview_seq = int(snapshot.get("preview_seq", 0))
         updated_at = float(snapshot.get("updated_at", 0.0) or 0.0)
@@ -152,6 +187,10 @@ def dashboard() -> None:
             "violations_logged": violations_logged,
         })
         live_meta_strip.refresh()
+        if not active_job:
+            refresh_dashboard_panels(include_evidence=True)
+            live_preview_content.refresh()
+            return
         if violations_changed:
             if focus_latest_evidence():
                 refresh_dashboard_panels(include_evidence=True)
@@ -334,22 +373,6 @@ def dashboard() -> None:
         except Exception as exc:
             ui.notify(f"Could not save camera: {exc}", type="negative")
 
-    def clear_db() -> None:
-        confirm_widget = clear_confirm.get("widget")
-        if not confirm_widget or not confirm_widget.value:
-            ui.notify("Confirm the checkbox first", type="warning")
-            return
-        try:
-            clear_database()
-            storage["selected_violation_id"] = ""
-            storage["selected_job_id"] = ""
-            scope_toolbar.refresh()
-            refresh_live_sections(include_evidence=True)
-            settings_panel.refresh()
-            ui.notify("Database reset and default cameras restored", type="positive")
-        except Exception as exc:
-            ui.notify(f"Could not clear database: {exc}", type="negative")
-
     def download_filtered_csv() -> None:
         scope = get_analysis_scope(storage)
         df = search_violations(
@@ -403,21 +426,31 @@ def dashboard() -> None:
 
     @ui.refreshable
     def summary_strip() -> None:
-        scope = get_analysis_scope(storage)
-        scope_label = storage.get("filter_date_prefix") or "All time"
-        summary = get_counts_summary(date_prefix=scope)
-        active_jobs = len([job for job in job_manager.list_jobs() if job["status"] in {"queued", "running"}])
+        scope, use_demo, notice, scope_label = resolve_dashboard_scope()
+        demo_bundle = get_demo_bundle(scope)
+        summary = demo_bundle.summary if use_demo else get_counts_summary(date_prefix=scope)
+        active_jobs = (
+            len(demo_bundle.jobs)
+            if use_demo
+            else len([job for job in job_manager.list_jobs() if job["status"] in {"queued", "running"}])
+        )
         with ui.row().classes("w-full gap-4"):
             render_metric_card("Violations", summary["total"], f"Scope: {scope_label}", accent="metric-blue", icon="report")
             render_metric_card("Repeat alerts", summary["repeat"], "Repeat offenders prioritized", accent="metric-amber", icon="warning")
             render_metric_card("Cameras", summary["cameras"], "Registered locations", accent="metric-teal", icon="camera_alt")
             render_metric_card("Active jobs", active_jobs, "Uploads and webcams in flight", accent="metric-green", icon="task_alt")
+        if notice:
+            ui.label(notice).classes("field-hint")
+        ui.label(f"Scope: {scope_label}").classes("field-hint")
 
     @ui.refreshable
     def evidence_preview() -> None:
+        scope, _, _, _ = resolve_dashboard_scope()
         media_path = storage.get("uploaded_media_path") or storage.get("uploaded_video_path", "")
         media_name = storage.get("uploaded_media_name") or storage.get("uploaded_video_name", "")
         media_kind = storage.get("uploaded_media_kind") or detect_media_kind(media_name or media_path)
+        latest_evidence = latest_real_evidence_path(scope)
+        demo = get_demo_bundle(scope)
         with ui.card().classes("glass-card flex-1 min-w-0 preview-stage"):
             ui.label("1. Evidence preview").classes("section-title")
             ui.label("Uploaded image or source video stays here for quick review.").classes("section-copy")
@@ -431,36 +464,87 @@ def dashboard() -> None:
                     f"{media_name or path_obj.name} | {human_size(storage.get('uploaded_video_size', path_obj.stat().st_size))} | "
                     f"{path_obj.suffix.upper().lstrip('.') or media_kind.upper()}"
                 ).classes("field-hint")
+            elif latest_evidence:
+                ui.image(str(latest_evidence)).classes("w-full evidence-frame")
+                ui.label("Latest stored evidence").classes("section-title")
+                ui.label(
+                    "A real evidence frame from the database is shown here when no upload is loaded."
+                ).classes("field-hint")
             else:
-                with ui.column().classes("stage-placeholder items-center justify-center w-full gap-3"):
-                    ui.icon("image_search", size="4rem").classes("text-slate-400")
-                    ui.label("Drop traffic evidence above to start").classes("section-title")
-                    ui.label("JPG, PNG, MP4, AVI, MOV, and MKV are supported for upload.").classes("field-hint")
+                with ui.column().classes("w-full gap-3"):
+                    ui.image(demo.evidence_frame_url).classes("w-full evidence-frame")
+                    ui.label("Demo evidence preview").classes("section-title")
+                    ui.label(
+                        "A synthetic annotated frame is shown here until you upload real traffic evidence."
+                    ).classes("field-hint")
+                    with ui.row().classes("scan-chip-row"):
+                        for text in ["Stop line", "Vehicles", "OCR plate", "Signal state"]:
+                            ui.label(text).classes("scan-chip")
 
     @ui.refreshable
     def live_meta_strip() -> None:
         active_job = job_manager.get_active_job()
+        scope, use_demo, notice, scope_label = resolve_dashboard_scope()
+        demo_bundle = get_demo_bundle(scope)
+        demo_snapshot = demo_bundle.live_snapshot
+        if active_job:
+            snapshot = active_job.snapshot()
+        elif use_demo:
+            snapshot = demo_snapshot
+        else:
+            summary = get_counts_summary(date_prefix=scope)
+            latest_df = search_violations(limit=1, date_prefix=scope)
+            if latest_df.empty and scope is None:
+                latest_df = search_violations(limit=1)
+            latest_time = latest_df.iloc[0]["Time"] if not latest_df.empty else None
+            snapshot = {
+                "kind": "archive",
+                "status": "ready",
+                "source_label": "Stored evidence archive",
+                "message": notice or "Latest stored evidence is ready",
+                "progress": 1.0,
+                "total_frames": summary["total"],
+                "frames_processed": summary["total"],
+                "violations_logged": summary["total"],
+                "updated_at": time.time(),
+                "preview_caption": f"Latest stored evidence from {scope_label}",
+                "latest_time": latest_time,
+            }
         with ui.column().classes("w-full gap-2"):
             if active_job:
-                latest_snapshot = active_job.snapshot()
-                status_label = f"{latest_snapshot['kind'].title()} | {latest_snapshot['status'].title()}"
+                status_label = f"{snapshot['kind'].title()} | {snapshot['status'].title()}"
                 ui.label(status_label).classes("status-chip")
-                ui.label(f"Source: {latest_snapshot.get('source_label', 'n/a')}").classes("field-hint")
-                ui.label(f"Message: {latest_snapshot.get('message', '')}").classes("field-hint")
+                ui.label(f"Source: {snapshot.get('source_label', 'n/a')}").classes("field-hint")
+                ui.label(f"Message: {snapshot.get('message', '')}").classes("field-hint")
                 ui.linear_progress(
-                    value=float(latest_snapshot.get("progress", 0.0)),
+                    value=float(snapshot.get("progress", 0.0)),
                     show_value=True,
                     color="primary",
                 ).classes("w-full")
 
                 with ui.row().classes("w-full gap-2 flex-wrap"):
-                    ui.label(f"Frames: {latest_snapshot.get('frames_processed', 0)}").classes("status-chip")
-                    ui.label(f"Violations: {latest_snapshot.get('violations_logged', 0)}").classes("status-chip")
-                    ui.label(f"Total: {latest_snapshot.get('total_frames', 0)}").classes("status-chip")
-                    ui.label(f"Updated: {human_time(latest_snapshot.get('updated_at'))}").classes("status-chip")
+                    ui.label(f"Frames: {snapshot.get('frames_processed', 0)}").classes("status-chip")
+                    ui.label(f"Violations: {snapshot.get('violations_logged', 0)}").classes("status-chip")
+                    ui.label(f"Total: {snapshot.get('total_frames', 0)}").classes("status-chip")
+                    ui.label(f"Updated: {human_time(snapshot.get('updated_at'))}").classes("status-chip")
             else:
-                ui.label("No active job yet").classes("status-chip")
-                ui.label("Start analysis to stream the processed frame here.").classes("field-hint")
+                ui.label("Demo | Running" if use_demo else "Archive | Ready").classes("status-chip")
+                ui.label(f"Source: {snapshot.get('source_label', 'Synthetic traffic feed')}").classes("field-hint")
+                ui.label(f"Message: {snapshot.get('message', 'Demo scan running')}").classes("field-hint")
+                ui.linear_progress(
+                    value=float(snapshot.get("progress", 0.0)),
+                    show_value=True,
+                    color="primary",
+                ).classes("w-full")
+                with ui.row().classes("w-full gap-2 flex-wrap"):
+                    ui.label(f"Frames: {snapshot.get('frames_processed', 0)}").classes("status-chip")
+                    ui.label(f"Violations: {snapshot.get('violations_logged', 0)}").classes("status-chip")
+                    ui.label(f"Total: {snapshot.get('total_frames', 0)}").classes("status-chip")
+                    ui.label(f"Updated: {human_time(snapshot.get('updated_at'))}").classes("status-chip")
+                if use_demo:
+                    ui.label("Demo data is shown until a live analysis job starts.").classes("field-hint")
+                elif notice:
+                    ui.label(notice).classes("field-hint")
 
     @ui.refreshable
     def live_preview_content() -> None:
@@ -499,9 +583,9 @@ def dashboard() -> None:
 
         with ui.column().classes("stage-placeholder items-center justify-center w-full gap-3"):
             ui.icon("motion_photos_auto", size="4rem").classes("text-slate-400")
-            ui.label("Start analysis to see the live annotated frame here").classes("section-title")
+            ui.label("No live processing running").classes("section-title")
             ui.label(
-                "This pane shows detected vehicles, red-line markers, parking boxes, wrong-side lanes, and plate OCR results."
+                "Start upload analysis or webcam analysis to stream the processed frame here."
             ).classes("field-hint")
 
     def live_processing_panel() -> None:
@@ -581,11 +665,22 @@ def dashboard() -> None:
 
     @ui.refreshable
     def overview_panel() -> None:
-        scope = get_analysis_scope(storage)
+        scope, use_demo, notice, _ = resolve_dashboard_scope()
+        demo = get_demo_bundle(scope)
         recent_df = get_recent_violations(limit=8, date_prefix=scope)
         type_df = get_violations_by_type(date_prefix=scope)
         trend_df = get_violations_over_time(date_prefix=scope)
         camera_df = get_camera_wise_violations(date_prefix=scope)
+        if not use_demo and scope is None:
+            recent_df = get_recent_violations(limit=8)
+            type_df = get_violations_by_type()
+            trend_df = get_violations_over_time()
+            camera_df = get_camera_wise_violations()
+        if use_demo:
+            recent_df = demo.recent_violations.head(8).copy()
+            type_df = demo.violations_by_type.copy()
+            trend_df = demo.violations_over_time.copy()
+            camera_df = demo.camera_wise.copy()
         with ui.column().classes("w-full gap-4"):
             with ui.row().classes("w-full gap-4"):
                 with ui.card().classes("glass-card flex-1 min-w-[300px]"):
@@ -616,11 +711,15 @@ def dashboard() -> None:
                 with ui.card().classes("glass-card flex-1 min-w-[300px]"):
                     ui.label("Recent violations").classes("section-title")
                     ui.label("The latest evidence entries for this scope.").classes("section-copy")
+                    if notice:
+                        ui.label(notice).classes("field-hint")
                     render_data_table(recent_df, pagination=8, row_key="Time")
 
     @ui.refreshable
     def evidence_panel() -> None:
-        scope = get_analysis_scope(storage)
+        scope, use_demo, notice, _ = resolve_dashboard_scope()
+        demo = get_demo_bundle(scope)
+        fallback_notice = ""
         df = search_violations(
             query=str(controls["filter_query"].value or "").strip(),
             violation_type=str(controls["filter_violation_type"].value or "ALL"),
@@ -628,7 +727,26 @@ def dashboard() -> None:
             date_prefix=scope,
             limit=500,
         )
+        if df.empty and not use_demo:
+            df = search_violations(
+                query=str(controls["filter_query"].value or "").strip(),
+                violation_type=str(controls["filter_violation_type"].value or "ALL"),
+                camera_id=str(controls["filter_camera_id"].value or "ALL"),
+                limit=500,
+            )
+        if df.empty and not use_demo:
+            fallback_row = latest_violation_row(scope)
+            if fallback_row is None and scope is not None:
+                fallback_row = latest_violation_row(None)
+            if fallback_row:
+                df = pd.DataFrame([fallback_row])
+                fallback_notice = "No records matched the current filters, so showing the latest available evidence instead."
         rows = dataframe_to_rows(df)
+        using_demo = False
+        if df.empty and use_demo:
+            df = demo.recent_violations.copy()
+            rows = dataframe_to_rows(df)
+            using_demo = True
         selected_id = storage.get("selected_violation_id", "")
         if rows and (not selected_id or all(str(row.get("id")) != str(selected_id) for row in rows)):
             selected_id = rows[0].get("id", "")
@@ -636,16 +754,23 @@ def dashboard() -> None:
 
         selected_row = next((row for row in rows if str(row.get("id")) == str(selected_id)), rows[0] if rows else None)
 
-        def on_select(event: Any) -> None:
-            if event.selection:
-                storage["selected_violation_id"] = event.selection[0]["id"]
-                evidence_panel.refresh()
+        def open_evidence(row_id: Any) -> None:
+            if row_id in (None, ""):
+                return
+            storage["selected_violation_id"] = row_id
+            evidence_panel.refresh()
 
         with ui.card().classes("glass-card w-full"):
             with ui.row().classes("w-full items-center justify-between gap-3"):
                 with ui.column().classes("gap-0"):
                     ui.label("Evidence browser").classes("section-title")
                     ui.label("Click a violation row to open the exact evidence frame.").classes("section-copy")
+                    if notice:
+                        ui.label(notice).classes("field-hint")
+                    if fallback_notice:
+                        ui.label(fallback_notice).classes("field-hint")
+                    if using_demo:
+                        ui.label("Demo evidence is shown until real violations are available.").classes("field-hint")
                 ui.button("Export CSV", icon="download", on_click=download_filtered_csv).props("flat")
 
             if df.empty:
@@ -653,8 +778,42 @@ def dashboard() -> None:
                 return
 
             with ui.row().classes("w-full gap-4"):
-                with ui.column().classes("flex-[1.4] min-w-[540px] gap-3"):
-                    render_data_table(df, pagination=10, row_key="id", selection="single", on_select=on_select)
+                with ui.column().classes("flex-[1.3] min-w-[540px] gap-3"):
+                    ui.label("All evidences").classes("section-title")
+                    ui.label(f"{len(rows)} evidence record(s) in the current scope.").classes("section-copy")
+                    with ui.column().classes("evidence-list w-full gap-3"):
+                        for row in rows:
+                            row_id = row.get("id", "")
+                            evidence_value = str(row.get("Evidence", "") or "").strip()
+                            evidence_path = Path(evidence_value) if evidence_value else None
+                            if evidence_path and not evidence_path.exists():
+                                evidence_path = None
+                            is_active = str(row_id) == str(selected_id)
+                            with ui.card().classes(f"evidence-item w-full {'active' if is_active else ''}"):
+                                with ui.row().classes("w-full items-start justify-between gap-3"):
+                                    with ui.column().classes("flex-1 gap-1"):
+                                        ui.label(f"{row.get('Violation Type', '')}").classes("field-label")
+                                        ui.label(f"Plate: {row.get('Plate Number', 'UNKNOWN')}").classes("field-hint")
+                                        ui.label(f"Camera: {row.get('Camera ID', '')} | Location: {row.get('Location', '')}").classes("field-hint")
+                                        ui.label(f"Time: {row.get('Time', '')} | Confidence: {row.get('Confidence', '')}").classes("field-hint")
+                                        if evidence_value.startswith("demo:") and using_demo:
+                                            ui.label("Synthetic demo evidence").classes("status-chip warn")
+                                        elif evidence_path:
+                                            ui.label("Evidence image available").classes("status-chip good")
+                                        else:
+                                            ui.label("No evidence image stored").classes("status-chip warn")
+                                    with ui.column().classes("items-end gap-2"):
+                                        ui.button(
+                                            "Open",
+                                            icon="visibility",
+                                            on_click=lambda row_id=row_id: open_evidence(row_id),
+                                        ).props("flat")
+                                        if evidence_path:
+                                            ui.button(
+                                                "Download",
+                                                icon="download",
+                                                on_click=lambda path=evidence_path: ui.download(path, filename=path.name),
+                                            ).props("flat")
                 with ui.column().classes("flex-[0.9] min-w-[340px] gap-3"):
                     ui.label("Selected violation").classes("section-title")
                     if selected_row:
@@ -677,6 +836,9 @@ def dashboard() -> None:
                                 ).props("flat")
                             except Exception:
                                 ui.label("Evidence image available, but the preview could not be rendered.").classes("field-hint")
+                        elif evidence_value.startswith("demo:") and using_demo:
+                            ui.image(demo.evidence_frame_url).classes("w-full evidence-frame")
+                            ui.label("Synthetic evidence frame").classes("field-hint")
                         else:
                             ui.label("No evidence image available for this row.").classes("field-hint")
                     else:
@@ -684,13 +846,20 @@ def dashboard() -> None:
 
     @ui.refreshable
     def hotspots_panel() -> None:
-        scope = get_analysis_scope(storage)
+        scope, use_demo, notice, _ = resolve_dashboard_scope()
+        demo = get_demo_bundle(scope)
         cameras_df = get_cameras_with_density(date_prefix=scope)
+        if not use_demo and scope is None:
+            cameras_df = get_cameras_with_density()
+        if use_demo:
+            cameras_df = demo.camera_wise.copy()
         with ui.card().classes("glass-card w-full"):
             with ui.row().classes("w-full items-center justify-between gap-3"):
                 with ui.column().classes("gap-0"):
                     ui.label("Hotspots and location intelligence").classes("section-title")
                     ui.label("Violation density across camera locations.").classes("section-copy")
+                    if notice:
+                        ui.label(notice).classes("field-hint")
                 ui.button("Refresh map", icon="refresh", on_click=hotspots_panel.refresh).props("flat")
 
             if cameras_df.empty:
@@ -707,13 +876,34 @@ def dashboard() -> None:
 
     @ui.refreshable
     def alerts_panel() -> None:
-        scope = get_analysis_scope(storage)
+        scope, use_demo, notice, _ = resolve_dashboard_scope()
+        demo = get_demo_bundle(scope)
         df = get_repeat_offender_alerts(date_prefix=scope)
+        if not use_demo and scope is None:
+            df = get_repeat_offender_alerts()
+        if use_demo:
+            df = demo.alerts.copy()
+        selected_plate = str(storage.get("selected_alert_plate", "") or "")
+        if not df.empty and (not selected_plate or all(str(row.get("Plate Number")) != selected_plate for row in dataframe_to_rows(df))):
+            selected_plate = str(df.iloc[0].get("Plate Number", "") or "")
+            storage["selected_alert_plate"] = selected_plate
+
+        rows = dataframe_to_rows(df)
+        selected_row = next((row for row in rows if str(row.get("Plate Number", "")) == selected_plate), rows[0] if rows else None)
+
+        def on_select(event: Any) -> None:
+            if event.selection:
+                selected_value = str(event.selection[0].get("Plate Number", "") or "")
+                storage["selected_alert_plate"] = selected_value
+                alerts_panel.refresh()
+
         with ui.card().classes("glass-card w-full"):
             with ui.row().classes("w-full items-center justify-between gap-3"):
                 with ui.column().classes("gap-0"):
                     ui.label("Repeat offender alerts").classes("section-title")
                     ui.label("Prioritize vehicles that keep violating the rules.").classes("section-copy")
+                    if notice:
+                        ui.label(notice).classes("field-hint")
                 ui.button("Export alerts", icon="download", on_click=download_alerts_csv).props("flat")
 
             if df.empty:
@@ -727,11 +917,64 @@ def dashboard() -> None:
                         ui.label("Top offender").classes("metric-label")
                         ui.label(str(item.get("Plate Number", "UNKNOWN"))).classes("metric-value")
                         ui.label(f"{item.get('Offense Count', 0)} offenses | {item.get('Latest Violation', '')}").classes("metric-note")
-            render_data_table(df, pagination=8, row_key="Plate Number")
+            with ui.row().classes("w-full gap-4"):
+                with ui.column().classes("flex-[1.1] min-w-[520px] gap-3"):
+                    render_data_table(df, pagination=8, row_key="Plate Number", selection="single", on_select=on_select)
+                with ui.column().classes("flex-[0.9] min-w-[360px] gap-3"):
+                    ui.label("Alert evidence").classes("section-title")
+                    if selected_row:
+                        plate = str(selected_row.get("Plate Number", "UNKNOWN"))
+                        ui.label(plate).classes("metric-value")
+                        ui.label(f"{selected_row.get('Offense Count', 0)} offense(s)").classes("field-hint")
+                        ui.label(f"Latest violation: {selected_row.get('Latest Violation', '')}").classes("field-hint")
+                        ui.label(f"Last detected: {selected_row.get('Last Detected', '')}").classes("field-hint")
+                        ui.label(f"History: {selected_row.get('Offense History', '')}").classes("field-hint")
+
+                        evidence_row = latest_violation_row(scope)
+                        if evidence_row and plate and str(evidence_row.get("Plate Number", "") or "") == plate:
+                            evidence_value = str(evidence_row.get("Evidence", "") or "").strip()
+                            evidence_path = Path(evidence_value) if evidence_value else None
+                            if evidence_path and evidence_path.exists():
+                                try:
+                                    ui.image(str(evidence_path)).classes("w-full evidence-frame")
+                                    ui.button(
+                                        "Download evidence",
+                                        icon="download",
+                                        on_click=lambda: ui.download(evidence_path, filename=evidence_path.name),
+                                    ).props("flat")
+                                except Exception:
+                                    ui.label("Evidence image available, but the preview could not be rendered.").classes("field-hint")
+                            else:
+                                ui.label("No linked evidence image found for this alert yet.").classes("field-hint")
+                        else:
+                            plate_matches = search_violations(query=plate, limit=1, date_prefix=scope)
+                            if plate_matches.empty and scope is not None:
+                                plate_matches = search_violations(query=plate, limit=1)
+                            if not plate_matches.empty:
+                                evidence_value = str(plate_matches.iloc[0].get("Evidence", "") or "").strip()
+                                evidence_path = Path(evidence_value) if evidence_value else None
+                                if evidence_path and evidence_path.exists():
+                                    try:
+                                        ui.image(str(evidence_path)).classes("w-full evidence-frame")
+                                        ui.button(
+                                            "Download evidence",
+                                            icon="download",
+                                            on_click=lambda: ui.download(evidence_path, filename=evidence_path.name),
+                                        ).props("flat")
+                                    except Exception:
+                                        ui.label("Evidence image available, but the preview could not be rendered.").classes("field-hint")
+                                else:
+                                    ui.label("No linked evidence image found for this alert yet.").classes("field-hint")
+                            else:
+                                ui.label("Select an alert to inspect the linked evidence frame.").classes("field-hint")
 
     @ui.refreshable
     def jobs_panel() -> None:
+        scope, use_demo, _, _ = resolve_dashboard_scope()
+        demo = get_demo_bundle(scope)
         jobs = job_manager.list_jobs()
+        if use_demo and not jobs:
+            jobs = demo.jobs.copy()
         selected_id = storage.get("selected_job_id", "")
         if jobs and (not selected_id or all(job["id"] != selected_id for job in jobs)):
             selected_id = jobs[0]["id"]
@@ -749,6 +992,8 @@ def dashboard() -> None:
                 with ui.column().classes("gap-0"):
                     ui.label("Background jobs").classes("section-title")
                     ui.label("Track image, video, and webcam analysis jobs from one place.").classes("section-copy")
+                    if use_demo:
+                        ui.label("Demo jobs are shown until a live analysis starts.").classes("field-hint")
                 with ui.row().classes("items-center gap-2"):
                     ui.button("Refresh", icon="refresh", on_click=jobs_panel.refresh).props("flat")
                     ui.button("Focus latest", icon="visibility", on_click=focus_latest_job).props("flat")
@@ -777,9 +1022,12 @@ def dashboard() -> None:
                         ui.label(f"Updated: {human_time(selected_job['updated_at'])}").classes("field-hint")
 
                         preview_b64 = selected_job.get("preview_b64", "")
-                        if preview_b64:
+                        if preview_b64 and not str(selected_job.get("id", "")).startswith("demo-"):
                             ui.image(f"data:image/jpeg;base64,{preview_b64}").classes("w-full live-frame")
                             ui.label(selected_job.get("preview_caption") or "Latest annotated frame").classes("field-hint")
+                        elif preview_b64 and use_demo:
+                            ui.image(demo.live_frame_url).classes("w-full live-frame")
+                            ui.label(selected_job.get("preview_caption") or "Synthetic demo frame").classes("field-hint")
                     else:
                         ui.label("Select a job to inspect details.").classes("field-hint")
 
@@ -849,15 +1097,6 @@ def dashboard() -> None:
                     pagination=8,
                     row_key="camera_id",
                 )
-
-        with ui.card().classes("glass-card w-full mt-4"):
-            with ui.row().classes("w-full items-center justify-between gap-3"):
-                with ui.column().classes("gap-0"):
-                    ui.label("Data reset").classes("section-title")
-                    ui.label("Clear the database and restore the default camera list.").classes("section-copy")
-                ui.label(f"OpenCV: {dependency_state_local['opencv']}  |  Detector: {dependency_state_local['detector_available']}  |  OCR: {dependency_state_local['ocr_available']}").classes("field-hint")
-            clear_confirm["widget"] = ui.checkbox("I understand this will clear violations, alerts, and cameras.")
-            ui.button("Clear database", icon="delete_forever", on_click=clear_db).props("unelevated color=negative")
 
     @ui.refreshable
     def evaluation_panel() -> None:

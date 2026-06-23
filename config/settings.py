@@ -16,7 +16,6 @@ os.makedirs(PARKING_COORDS_DIR, exist_ok=True)
 # Database file
 DB_PATH = os.path.join(DATA_DIR, "traffic_dashboard.db")
 APP_SETTINGS_PATH = os.path.join(DATA_DIR, "dashboard_settings.json")
-MAPPLS_API_KEY = os.getenv("MAPPLS_API_KEY", "").strip()
 
 # General Settings
 VIOLATION_ALERT_THRESHOLD = 3  # Alert if a plate is seen 3+ times

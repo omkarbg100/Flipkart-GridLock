@@ -335,25 +335,6 @@ def get_counts_summary(date_prefix=None):
     }
 
 
-def clear_database():
-    """Deletes all records from violations, cameras, and alerts tables."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM violations")
-    cursor.execute("DELETE FROM alerts")
-    cursor.execute("DELETE FROM cameras")
-    
-    # Repopulate cameras
-    for cam in DEFAULT_CAMERAS:
-        cursor.execute("""
-        INSERT INTO cameras (camera_id, location, latitude, longitude)
-        VALUES (?, ?, ?, ?)
-        """, (cam["id"], cam["location"], cam["latitude"], cam["longitude"]))
-        
-    conn.commit()
-    conn.close()
-
-
 def get_alerts_count():
     """Return the current number of repeat-offender alerts."""
     conn = get_db_connection()

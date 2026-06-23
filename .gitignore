@@ -10,21 +10,15 @@ __pycache__/
 venv/
 env/
 
-# Streamlit / app artifacts
+# App/runtime artifacts
 .streamlit/
+.nicegui/
 
-# Generated runtime data
-data/*.db
-data/evidence/*
-!data/evidence/.gitkeep
-data/uploads/*
-!data/uploads/.gitkeep
+# Keep generated output in GitHub, but do not version raw uploads.
 
-# Legacy demo outputs
-**/Output/*
-**/output*.avi
-**/output*.mp4
-**/output*.mkv
+# Keep the generated dashboard output in GitHub.
+# Evidence frames and the SQLite database are small enough to version,
+# but raw source uploads are ignored because they can be very large.
 
 # IDE files
 .idea/

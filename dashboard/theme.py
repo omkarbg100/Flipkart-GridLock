@@ -239,6 +239,32 @@ body {
   filter: brightness(1.03);
 }
 
+.evidence-list {
+  max-height: 620px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.evidence-item {
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(10, 16, 29, 0.56);
+  transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+}
+
+.evidence-item:hover {
+  transform: translateY(-1px);
+  border-color: rgba(77, 150, 255, 0.32);
+  background: rgba(12, 20, 36, 0.7);
+}
+
+.evidence-item.active {
+  border-color: rgba(45, 212, 191, 0.5);
+  background: rgba(12, 28, 34, 0.82);
+  box-shadow: inset 0 0 0 1px rgba(45, 212, 191, 0.18);
+}
+
 .stage-placeholder {
   min-height: 360px;
   border-radius: 18px;
@@ -320,14 +346,6 @@ body {
 }
 
 .map-shell .nicegui-leaflet {
-  width: 100%;
-  height: 540px;
-  border: 0;
-  border-radius: 18px;
-  overflow: hidden;
-}
-
-.mappls-hotspot-map {
   width: 100%;
   height: 540px;
   border: 0;

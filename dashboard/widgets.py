@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import json
-import uuid
 from typing import Any
 
 import pandas as pd
 import plotly.express as px
 from nicegui import ui
 
-from config.settings import MAPPLS_API_KEY
 from .helpers import dataframe_to_rows, table_columns
 
 VIBRANT_DARK_PIE_COLORS = [
@@ -123,91 +120,7 @@ def render_hotspot_map(cameras_df: pd.DataFrame, scope_prefix: str | None = None
 
     ui.label(f"Scope: {scope_prefix or 'All time'}").classes("field-hint")
 
-    if MAPPLS_API_KEY:
-        map_id = f"mappls_hotspots_{uuid.uuid4().hex[:8]}"
-        markers = []
-        for _, row in cameras_df.iterrows():
-            lat = float(row["latitude"])
-            lon = float(row["longitude"])
-            count = int(row["count"])
-            location = str(row["location"])
-            camera_id = str(row["camera_id"])
-            if count > 10:
-                color = "#fb7185"
-            elif count > 3:
-                color = "#f4b860"
-            else:
-                color = "#2dd4bf"
-            markers.append(
-                {
-                    "lat": lat,
-                    "lng": lon,
-                    "count": count,
-                    "location": location,
-                    "camera_id": camera_id,
-                    "color": color,
-                }
-            )
-
-        ui.label("Map provider: Mappls").classes("status-chip good")
-        ui.html(f'<div id="{map_id}" class="mappls-hotspot-map"></div>').classes("w-full")
-
-        script_src = f"https://apis.mappls.com/advancedmaps/api/{MAPPLS_API_KEY}/map_sdk?v=3.0&layer=vector"
-        ui.run_javascript(
-            f"""
-            (function() {{
-              const mapId = {json.dumps(map_id)};
-              const scriptSrc = {json.dumps(script_src)};
-              const center = {json.dumps({"lat": avg_lat, "lng": avg_lon})};
-              const markers = {json.dumps(markers)};
-
-              function initMap() {{
-                const el = document.getElementById(mapId);
-                if (!el || el.dataset.gridlockMapplsReady === "1") {{
-                  return true;
-                }}
-                if (!window.mappls || !window.mappls.Map || !window.mappls.Marker) {{
-                  return false;
-                }}
-
-                el.dataset.gridlockMapplsReady = "1";
-                const map = new mappls.Map(mapId, {{ center: center, zoom: 12 }});
-                markers.forEach((item) => {{
-                  try {{
-                    new mappls.Marker({{
-                      map: map,
-                      position: {{ lat: item.lat, lng: item.lng }},
-                      title: `${{item.camera_id}} | ${{item.location}} | ${{item.count}} violations`,
-                    }});
-                  }} catch (error) {{
-                    console.error("Mappls marker render failed", error);
-                  }}
-                }});
-                return true;
-              }}
-
-              if (initMap()) {{
-                return;
-              }}
-
-              if (!document.querySelector(`script[src="${{scriptSrc}}"]`)) {{
-                const script = document.createElement("script");
-                script.src = scriptSrc;
-                script.async = true;
-                document.head.appendChild(script);
-              }}
-
-              let attempts = 0;
-              const timer = setInterval(() => {{
-                attempts += 1;
-                if (initMap() || attempts > 50) {{
-                  clearInterval(timer);
-                }}
-              }}, 200);
-            }})();
-            """
-        )
-        return
+    ui.label("Map provider: Leaflet").classes("status-chip good")
 
     leaflet_map = ui.leaflet(center=(avg_lat, avg_lon), zoom=12).classes("w-full")
     leaflet_map.style("height: 540px")
